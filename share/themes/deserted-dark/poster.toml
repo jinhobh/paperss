@@ -1,0 +1,38 @@
+# Normalized boxes for the `deserted` System 7 composition. Values are
+# fractions of the 3840x2400 render canvas, so the layout stays
+# resolution-independent.
+#
+# Only names the style actually draws are read, so these coexist with the
+# klein theme's component set in the same file format.
+
+[components.calendar]
+x = 0.400
+y = 0.275
+w = 0.140
+h = 0.170
+
+[components.fetch]
+x = 0.250
+y = 0.495
+w = 0.225
+h = 0.205
+
+[components.threads]
+x = 0.545
+y = 0.245
+w = 0.220
+h = 0.500
+
+[components.todo]
+x = 0.795
+y = 0.510
+w = 0.150
+h = 0.150
+# h is the floor; the window grows down to max_h to fit its tasks.
+max_h = 0.330
+
+[components.focus]
+x = 0.070
+y = 0.800
+w = 0.200
+h = 0.100

@@ -1,0 +1,52 @@
+# matugen config for the `retheme` pipeline.
+# Every target below is regenerated from one wallpaper/seed color.
+
+[config]
+
+[templates.kitty]
+input_path = '~/.config/matugen/templates/kitty-palette.conf'
+output_path = '~/.config/kitty/matugen-theme.conf'
+post_hook = 'kitty @ --to unix:/tmp/kitty load-config 2>/dev/null || true'
+
+# The named colors are shared; gtk3.css and gtk4.css each @import this and add
+# only what differs between the toolkits (window corner radius).
+[templates.gtk_colors]
+input_path = '~/.config/matugen/templates/gtk.css'
+output_path = '~/.local/share/rice/gtk-colors.css'
+
+[templates.gtk4]
+input_path = '~/.config/matugen/templates/gtk4.css'
+output_path = '~/.config/gtk-4.0/gtk.css'
+
+[templates.gtk3]
+input_path = '~/.config/matugen/templates/gtk3.css'
+output_path = '~/.config/gtk-3.0/gtk.css'
+
+[templates.shell]
+input_path = '~/.config/matugen/templates/gnome-shell.css'
+output_path = '~/.themes/Rice/gnome-shell/gnome-shell.css'
+
+[templates.fastfetch]
+input_path = '~/.config/matugen/templates/fastfetch.jsonc'
+output_path = '~/.config/fastfetch/config.jsonc'
+
+[templates.bat]
+input_path = '~/.config/matugen/templates/rice.tmTheme'
+output_path = '~/.config/bat/themes/rice.tmTheme'
+post_hook = 'batcat cache --build >/dev/null 2>&1 || bat cache --build >/dev/null 2>&1 || true'
+
+[templates.shell_theme]
+input_path = '~/.config/matugen/templates/shell-theme.sh'
+output_path = '~/.local/share/rice/shell-theme.sh'
+
+[templates.colors_sh]
+input_path = '~/.config/matugen/templates/colors.sh'
+output_path = '~/.local/share/rice/colors.sh'
+
+[templates.colors_json]
+input_path = '~/.config/matugen/templates/colors.json'
+output_path = '~/.local/share/rice/colors.json'
+
+[templates.nvim]
+input_path = '~/.config/matugen/templates/rice-palette.lua'
+output_path = '~/.config/nvim/lua/config/rice-palette.lua'

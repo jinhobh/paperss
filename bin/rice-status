@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""rice-status — publish a small JSON summary of the day for the panel widget.
+
+The GNOME extension can't read SQLite, so this writes a snapshot it can poll.
+Written atomically so the extension never sees a half-finished file.
+
+    rice-status            # write ~/.local/share/rice/status.json
+    rice-status --print    # also dump it to stdout
+"""
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local/share/rice/lib"))
+import ricedata as R  # noqa: E402
+
+OUT = Path.home() / ".local/share/rice/status.json"
+
+
+def build():
+    snap = R.snapshot()
+    streak = R.current_streak()
+    peak = max(snap["hourly"]) or 1.0
+    return {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "date": snap["date"],
+        "available": snap["available"],
+        "headline": R.headline_word(snap),
+        "top_app": snap["top_app"],
+        "top_app_label": R.fmt_duration(snap["top_app_secs"]),
+        "top_repo": (Path(snap["top_repo"]).name if snap["top_repo"] else None),
+        "repo_edits": snap["repo_edits"],
+        "total_secs": int(snap["total_secs"]),
+        "total_label": R.fmt_duration(snap["total_secs"]),
+        "streak_secs": int(streak),
+        "streak_label": R.fmt_duration(streak),
+        "sessions": snap["sessions"],
+        # Normalised 0-8 levels: the extension renders these as block glyphs.
+        "spark": [min(8, round(8 * (v / peak))) for v in snap["hourly"]],
+        "apps": [{"name": a, "label": R.fmt_duration(s)} for a, s in snap["apps"][:6]],
+        "repos": [{"name": Path(p).name, "edits": n} for p, n in snap["repos"][:6]],
+        "palette": R.palette(),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--print", dest="show", action="store_true")
+    args = ap.parse_args()
+
+    data = build()
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = OUT.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, OUT)  # atomic: readers see old or new, never partial
+    if args.show:
+        print(json.dumps(data, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""todo — the task list painted on the wallpaper.
+
+    todo                        # show the list
+    todo buy coffee filters     # add a task (no subcommand needed)
+    todo add "buy coffee"       # same, explicit
+    todo done 2                 # check off #2   (accepts several: done 1 3)
+    todo undo 2                 # uncheck it
+    todo rm 2                   # delete #2
+    todo clear                  # delete everything already checked off
+    todo edit 2 new text        # reword #2
+
+Every change repaints the wallpaper. Pass --quiet to skip that when you're
+scripting a batch of edits — the hourly `rice-poster.timer` will catch up.
+
+Numbers are the positions shown by `todo`, not stable ids, so always look
+before you leap on a list you haven't just printed.
+"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / ".local/share/rice/lib"))
+import ricedata as R  # noqa: E402
+
+COMMANDS = {"add", "done", "undo", "rm", "delete", "clear", "edit", "list", "ls"}
+
+C_DIM = "\033[2m"
+C_OFF = "\033[0m"
+C_OK = "\033[32m"
+C_STRIKE = "\033[9m"
+
+
+def repaint(quiet=False):
+    """Re-render the poster and let GNOME pick the new pixels up.
+
+    The shell watches the wallpaper file, so replacing it is enough to make it
+    redraw — the URI only needs setting when something else has taken the
+    background over. Clearing the URI first (the old trick for forcing a
+    reload) is worse than useless: the shell resolves the empty URI against the
+    working directory, fails to load it, and that exception escapes the same
+    code path that swaps in the new background actor — killing the repaint it
+    was meant to force.
+    """
+    res = subprocess.run(["poster"], capture_output=True, text=True)
+    if res.returncode != 0:
+        print(res.stderr.strip(), file=sys.stderr)
+        print("warning: wallpaper not repainted", file=sys.stderr)
+        return
+    out = Path.home() / "Pictures/Wallpapers/jinho-poster-generated.png"
+    uri = out.resolve().as_uri()
+    for key in ("picture-uri", "picture-uri-dark"):
+        cur = subprocess.run(["gsettings", "get", "org.gnome.desktop.background", key],
+                             capture_output=True, text=True).stdout.strip().strip("'")
+        if cur != uri:
+            subprocess.run(["gsettings", "set", "org.gnome.desktop.background",
+                            key, uri], capture_output=True)
+    if not quiet:
+        print(f"{C_DIM}wallpaper repainted{C_OFF}")
+
+
+def show(items):
+    if not items:
+        print(f"{C_DIM}nothing on the list — `todo <task>` to add one{C_OFF}")
+        return
+    width = len(str(len(items)))
+    for n, item in enumerate(items, 1):
+        if item.get("done"):
+            print(f"{C_DIM}{n:>{width}}. {C_OK}✓{C_OFF} "
+                  f"{C_DIM}{C_STRIKE}{item['text']}{C_OFF}")
+        else:
+            print(f"{n:>{width}}. {C_DIM}·{C_OFF} {item['text']}")
+    open_n = sum(1 for i in items if not i.get("done"))
+    print(f"{C_DIM}{open_n} open / {len(items)} total{C_OFF}")
+
+
+def pick(items, numbers):
+    """Resolve display numbers to items, reporting any that don't exist."""
+    chosen, bad = [], []
+    for raw in numbers:
+        try:
+            n = int(raw)
+        except ValueError:
+            bad.append(raw)
+            continue
+        if 1 <= n <= len(items):
+            chosen.append(items[n - 1])
+        else:
+            bad.append(raw)
+    for b in bad:
+        print(f"no task {b}", file=sys.stderr)
+    return chosen
+
+
+def main():
+    # Parsed by hand rather than with argparse: task text is free-form and must
+    # survive verbatim, so flags are simply lifted out wherever they appear
+    # instead of terminating the positional list.
+    argv = sys.argv[1:]
+    quiet = any(a in ("-q", "--quiet") for a in argv)
+    if any(a in ("-h", "--help") for a in argv):
+        print(__doc__.strip())
+        return
+    argv = [a for a in argv if a not in ("-q", "--quiet")]
+
+    items = R.load_todos()
+
+    # Bare `todo`, or an unrecognised first word, means "add this text" —
+    # adding is the common case and shouldn't need a subcommand.
+    cmd = argv[0].lower() if argv else "list"
+    if cmd not in COMMANDS:
+        cmd, rest = "add", argv
+    else:
+        rest = argv[1:]
+
+    if cmd in ("list", "ls"):
+        show(items)
+        return
+
+    if cmd == "add":
+        text = " ".join(rest).strip()
+        if not text:
+            show(items)
+            return
+        items.append({"text": text, "done": False, "created": time.time()})
+        R.save_todos(items)
+        print(f"{C_OK}+{C_OFF} {text}")
+
+    elif cmd in ("done", "undo"):
+        targets = pick(items, rest)
+        if not targets:
+            return
+        for t in targets:
+            t["done"] = (cmd == "done")
+            t["done_ts"] = time.time() if cmd == "done" else None
+        R.save_todos(items)
+        mark = f"{C_OK}✓{C_OFF}" if cmd == "done" else "↺"
+        for t in targets:
+            print(f"{mark} {t['text']}")
+
+    elif cmd in ("rm", "delete"):
+        targets = pick(items, rest)
+        if not targets:
+            return
+        keep = [i for i in items if i not in targets]
+        R.save_todos(keep)
+        for t in targets:
+            print(f"{C_DIM}−  {t['text']}{C_OFF}")
+        items = keep
+
+    elif cmd == "clear":
+        keep = [i for i in items if not i.get("done")]
+        removed = len(items) - len(keep)
+        if not removed:
+            print(f"{C_DIM}nothing checked off to clear{C_OFF}")
+            return
+        R.save_todos(keep)
+        print(f"{C_DIM}cleared {removed} completed{C_OFF}")
+
+    elif cmd == "edit":
+        if len(rest) < 2:
+            sys.exit("usage: todo edit <n> <new text>")
+        targets = pick(items, rest[:1])
+        if not targets:
+            return
+        targets[0]["text"] = " ".join(rest[1:]).strip()
+        R.save_todos(items)
+        print(f"~ {targets[0]['text']}")
+
+    repaint(quiet=quiet)
+
+
+if __name__ == "__main__":
+    main()
