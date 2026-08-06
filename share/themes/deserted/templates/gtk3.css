@@ -15,7 +15,7 @@
    compositor-level clipper (Rounded Window Corners Reborn, at radius 0) is
    what squares kitty. */
 
-@import url("file:///home/jinho/.local/share/rice/gtk-colors.css");
+@import url("rice-colors.css");
 
 decoration,
 decoration:backdrop,

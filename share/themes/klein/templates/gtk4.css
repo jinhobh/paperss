@@ -4,4 +4,4 @@
    GTK4 entry point. libadwaita already rounds all four window corners, so
    unlike the GTK3 file this adds nothing beyond the shared colors. */
 
-@import url("file:///home/jinho/.local/share/rice/gtk-colors.css");
+@import url("rice-colors.css");

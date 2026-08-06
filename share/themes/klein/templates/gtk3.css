@@ -4,7 +4,7 @@
    GTK3 entry point. Colors are shared with GTK4 via the imported file; only
    the decoration rule below is toolkit-specific. */
 
-@import url("file:///home/jinho/.local/share/rice/gtk-colors.css");
+@import url("rice-colors.css");
 
 /* Adwaita's GTK3 decoration is `border-radius: 8px 8px 0 0` — rounded top,
    square bottom. Rounding all four matches GTK4/libadwaita, which already

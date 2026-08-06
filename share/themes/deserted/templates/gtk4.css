@@ -9,7 +9,7 @@
    that is most of the effect; the window silhouette itself is squared by the
    compositor-level clipper at radius 0, which reaches every toolkit. */
 
-@import url("file:///home/jinho/.local/share/rice/gtk-colors.css");
+@import url("rice-colors.css");
 
 window.csd,
 window.csd.dialog,
