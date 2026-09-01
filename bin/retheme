@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""retheme — drive the whole desktop palette from one wallpaper or seed color.
+
+    retheme <image>              # palette from an image, and set it as wallpaper
+    retheme --seed '#040480'     # palette from a color, wallpaper untouched
+    retheme --relight            # re-apply the current palette (after config edits)
+    retheme --scheme vibrant     # matugen scheme variant (default: tonal-spot)
+    retheme <image> --tint 0.6   # push surfaces toward the source hue
+
+Targets are declared in ~/.config/matugen/config.toml. This script adds the
+things matugen can't template: the GNOME wallpaper, the named shell accent,
+starship's inline palette block, and reload signals.
+
+It also adds a tint stage. Material You always renders dark-mode surfaces as
+near-black regardless of the seed, which flattens a strongly-hued identity
+(a Klein-blue wallpaper produces a #131318 desktop). `--tint` rotates the
+surface family toward the source hue *at constant lightness*, so the field
+carries the color while every M3 contrast pairing still holds.
+"""
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOME = Path.home()
+MATUGEN = shutil.which("matugen") or str(HOME / ".local/bin/matugen")
+STATE = HOME / ".local/share/rice"
+STATE_FILE = STATE / "state.json"
+COLORS_JSON = STATE / "colors.json"
+WALLPAPER_THEMES = STATE / "wallpaper-themes.json"
+STARSHIP = HOME / ".config/starship.toml"
+KITTY_CONF = HOME / ".config/kitty/kitty.conf"
+
+# Extensions ship their schemas inside their own directory rather than in the
+# system schema path, so gsettings needs --schemadir to see them.
+EXT = HOME / ".local/share/gnome-shell/extensions"
+TILINGSHELL_SCHEMAS = EXT / "tilingshell@ferrarodomenico.com/schemas"
+RWC_SCHEMAS = EXT / "rounded-window-corners@fxgn/schemas"
+USER_THEME_SCHEMAS = EXT / "user-theme@gnome-shell-extensions.gcampax.github.com/schemas"
+
+SHELL_THEME = "Rice"
+
+# The root-window theme uses nearly square workstation windows. A tiny radius
+# avoids broken antialiasing at the corners without reading as a rounded card.
+ROUNDED_RADIUS = 2          # fallback when no theme profile is active
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
+
+
+def rounded_radius():
+    """The corner radius the active theme asks for.
+
+    A theme owns its corner radius, but `retheme` is also run directly and by
+    `poster --apply` every hour — and it rewrites the whole packed corner dict
+    each time. Without reading the profile here, an hourly run would quietly
+    put the klein theme's 2px radius back on a square System 7 desktop.
+    """
+    try:
+        name = (STATE / "current-theme").read_text().strip()
+        manifest = STATE / "themes" / name / "theme.json"
+        r = json.loads(manifest.read_text()).get("chrome", {}).get("corner_radius")
+        return int(r) if r is not None else ROUNDED_RADIUS
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ROUNDED_RADIUS
+
+
+def matugen_image_path(path: Path) -> tuple[Path, Path | None]:
+    """Give extension-dependent Matugen a typed symlink for unnamed images."""
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        return path, None
+    try:
+        with path.open("rb") as source:
+            header = source.read(16)
+    except OSError:
+        return path, None
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        suffix = ".png"
+    elif header.startswith(b"\xff\xd8\xff"):
+        suffix = ".jpg"
+    elif header.startswith((b"GIF87a", b"GIF89a")):
+        suffix = ".gif"
+    elif header.startswith(b"BM"):
+        suffix = ".bmp"
+    elif header.startswith((b"II*\x00", b"MM\x00*")):
+        suffix = ".tiff"
+    elif header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        suffix = ".webp"
+    elif header[4:8] == b"ftyp" and header[8:12] in (b"avif", b"avis"):
+        suffix = ".avif"
+    else:
+        return path, None
+
+    temporary = Path(tempfile.mkdtemp(prefix="rice-matugen-"))
+    link = temporary / f"wallpaper{suffix}"
+    link.symlink_to(path.resolve())
+    return link, temporary
+
+# libadwaita's named accents. GNOME only accepts these enum values, so we snap
+# the generated primary to whichever one is perceptually closest.
+NAMED_ACCENTS = {
+    "blue": "#3584e4", "teal": "#2190a4", "green": "#3a944a",
+    "yellow": "#c88800", "orange": "#ed5b00", "red": "#e62d42",
+    "pink": "#d56199", "purple": "#9141ac", "slate": "#6f8396",
+    "brown": "#986a44",
+}
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                          text=True, **kw)
+
+
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_to_lab(rgb):
+    """sRGB -> CIELAB (D65). Used so accent snapping matches how eyes see it."""
+    def lin(c):
+        c /= 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(c) for c in rgb)
+    x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+    y = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 1.00000
+    z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+
+    def f(t):
+        return t ** (1 / 3) if t > 0.008856 else (7.787 * t) + (16 / 116)
+    fx, fy, fz = f(x), f(y), f(z)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def lab_to_rgb(lab):
+    """CIELAB (D65) -> sRGB, clamped."""
+    L, a, b = lab
+    fy = (L + 16) / 116
+    fx, fz = fy + a / 500, fy - b / 200
+
+    def finv(t):
+        return t ** 3 if t ** 3 > 0.008856 else (t - 16 / 116) / 7.787
+    x, y, z = finv(fx) * 0.95047, finv(fy) * 1.00000, finv(fz) * 1.08883
+    r = 3.2406 * x - 1.5372 * y - 0.4986 * z
+    g = -0.9689 * x + 1.8758 * y + 0.0415 * z
+    bl = 0.0557 * x - 0.2040 * y + 1.0570 * z
+
+    def gam(c):
+        c = max(0.0, min(1.0, c))
+        c = 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+        return int(round(max(0.0, min(1.0, c)) * 255))
+    return (gam(r), gam(g), gam(bl))
+
+
+def rgb_to_hex(rgb):
+    return "#%02x%02x%02x" % rgb
+
+
+# Surfaces carry the tint fully; text/outline colors get a fraction of it so
+# they stay legible against the newly-colored field.
+TINT_FULL = (
+    "background", "surface", "surface_bright", "surface_dim", "surface_variant",
+    "surface_container", "surface_container_low", "surface_container_lowest",
+    "surface_container_high", "surface_container_highest",
+)
+TINT_SOFT = ("on_surface_variant", "outline", "outline_variant")
+
+
+def tint_palette(data, source_hex, amount):
+    """Rotate surface colors toward the source hue, preserving lightness.
+
+    Blending only the a/b chroma axes (never L) is what keeps every
+    foreground/background contrast ratio M3 computed still valid.
+    """
+    if amount <= 0:
+        return data
+    _, sa, sb = rgb_to_lab(hex_to_rgb(source_hex))
+    for key, factor in [(k, amount) for k in TINT_FULL] + \
+                       [(k, amount * 0.35) for k in TINT_SOFT]:
+        entry = data.get("colors", {}).get(key)
+        if not entry:
+            continue
+        for variant in ("dark", "light", "default"):
+            if variant not in entry:
+                continue
+            L, a, b = rgb_to_lab(hex_to_rgb(entry[variant]["color"]))
+            new = lab_to_rgb((L, a + (sa - a) * factor, b + (sb - b) * factor))
+            entry[variant]["color"] = rgb_to_hex(new)
+    return data
+
+
+def paper_palette(data, amount):
+    """Darken light-mode surfaces toward printed-paper lightness.
+
+    The exact mirror of the problem `tint_palette` solves. Material You pins
+    light-mode surfaces to near-white (L* 96-99) no matter what the seed is, so
+    a parchment seed still renders a white desktop. This pulls the surface
+    family down the L axis only — chroma untouched, so the hue the tint stage
+    just established survives — by a proportional amount, which moves the
+    near-whites a lot and leaves the already-mid containers nearly alone.
+
+    Foreground colors are deliberately not moved: light-mode text sits near
+    L* 15-50, so lowering the field it sits on only *reduces* the contrast
+    ratio, and the text pairings have headroom to give.
+
+    Measured at amount 12 on seed #6b5a3f: every `on_surface` pairing is AAA
+    (9.8:1 worst) and every `on_surface_variant` pairing is AA (5.4:1 worst).
+    `primary` against a surface lands at 3.7-4.6:1 — AA for large text only,
+    down from ~4.9:1 uncompressed. That is an accent role, not a body-text one,
+    so it is acceptable here; if a future theme sets small body text in
+    `primary`, lower this value rather than assuming the pairing holds.
+    """
+    if amount <= 0:
+        return data
+    for key in TINT_FULL:
+        entry = data.get("colors", {}).get(key)
+        if not entry:
+            continue
+        for variant in ("light", "default"):
+            if variant not in entry:
+                continue
+            L, a, b = rgb_to_lab(hex_to_rgb(entry[variant]["color"]))
+            entry[variant]["color"] = rgb_to_hex(
+                lab_to_rgb((max(0.0, L - amount * (L / 100.0)), a, b)))
+    return data
+
+
+TEXT_SURFACES = (
+    "background", "surface", "surface_bright", "surface_dim",
+    "surface_variant", "surface_container", "surface_container_low",
+    "surface_container_lowest", "surface_container_high",
+    "surface_container_highest",
+)
+
+
+def relative_luminance(hex_color):
+    """WCAG 2.2 relative luminance for an sRGB hex color."""
+    channels = []
+    for channel in hex_to_rgb(hex_color):
+        value = channel / 255.0
+        channels.append(value / 12.92 if value <= 0.04045 else
+                        ((value + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def contrast_ratio(first, second):
+    lighter, darker = sorted(
+        (relative_luminance(first), relative_luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def accessible_text_color(hex_color, backgrounds, target, mode):
+    """Move only L* until text clears `target` against every surface.
+
+    Retaining the original a/b coordinates keeps the wallpaper-derived hue.
+    Dark themes move toward white; light themes move toward black. Existing
+    colors that already pass are returned byte-for-byte unchanged.
+    """
+    if min(contrast_ratio(hex_color, bg) for bg in backgrounds) >= target:
+        return hex_color
+
+    lightness, a, b = rgb_to_lab(hex_to_rgb(hex_color))
+    endpoint = 100.0 if mode == "dark" else 0.0
+    for step in range(1, 1001):
+        amount = step / 1000.0
+        candidate_l = lightness + (endpoint - lightness) * amount
+        candidate = rgb_to_hex(lab_to_rgb((candidate_l, a, b)))
+        if min(contrast_ratio(candidate, bg) for bg in backgrounds) >= target:
+            return candidate
+    return "#ffffff" if mode == "dark" else "#000000"
+
+
+def add_accessible_text_roles(data, mode):
+    """Guarantee readable, palette-matched text for every generated theme.
+
+    Primary text targets WCAG AAA (7:1). Secondary and muted text target AA
+    (4.5:1). The muted role starts from Material's outline hue, but is kept
+    separate because `outline` is also a border token and only needs 3:1.
+    """
+    colors = data["colors"]
+    backgrounds = [
+        colors[key][mode]["color"] for key in TEXT_SURFACES
+        if key in colors and mode in colors[key]
+    ]
+    for role, target in (("on_surface", 7.0),
+                         ("on_surface_variant", 4.5)):
+        safe = accessible_text_color(
+            colors[role][mode]["color"], backgrounds, target, mode)
+        colors[role][mode]["color"] = safe
+        colors[role]["default"]["color"] = safe
+
+    muted = accessible_text_color(
+        colors["outline"][mode]["color"], backgrounds, 4.5, mode)
+    colors["rice_text_muted"] = {
+        variant: {"color": muted} for variant in ("dark", "light", "default")
+    }
+    return data
+
+
+# Material You has no green/yellow slot, so mapping starship's color_green onto
+# `tertiary` yields whatever hue the wallpaper happened to produce (often pink).
+# Instead we synthesize semantic colors at fixed hues, borrowing lightness and
+# chroma from the generated palette so they still read as part of the set.
+SEMANTIC_HUES = {"rice_red": 25.0, "rice_green": 145.0, "rice_yellow": 90.0}
+
+# Lightness band the semantic colors are allowed to borrow. Chroma cannot
+# survive at the extremes of the L axis: the `monochrome` scheme returns a
+# primary of pure #ffffff (L* 100), and red/green/yellow synthesized there
+# clamp to near-white pastels (#ffe8e4, #d2ffd7) that are indistinguishable in
+# a terminal. Clamping into a band that can actually carry chroma costs
+# ordinary palettes nothing — a tonal-spot primary already lands inside it.
+SEMANTIC_L = (40.0, 78.0)
+
+
+def add_semantic_colors(data, mode):
+    ref = data["colors"]["primary"][mode]["color"]
+    L, a, b = rgb_to_lab(hex_to_rgb(ref))
+    L = max(SEMANTIC_L[0], min(SEMANTIC_L[1], L))
+    chroma = max(35.0, math.hypot(a, b))
+    for name, hue in SEMANTIC_HUES.items():
+        rad = math.radians(hue)
+        rgb = lab_to_rgb((L, chroma * math.cos(rad), chroma * math.sin(rad)))
+        hx = rgb_to_hex(rgb)
+        data["colors"][name] = {v: {"color": hx} for v in ("dark", "light", "default")}
+    return data
+
+
+def nearest_accent(hex_color):
+    """Snap to the closest named accent, weighting hue over lightness.
+
+    Generated primaries are pastel (high L), named accents are saturated, so
+    plain deltaE would collapse everything onto 'slate'. Discounting the L
+    axis keeps the comparison about hue and chroma, which is what reads as
+    'the accent color' on screen.
+    """
+    L1, a1, b1 = rgb_to_lab(hex_to_rgb(hex_color))
+    best, best_d = "blue", float("inf")
+    for name, hx in NAMED_ACCENTS.items():
+        L2, a2, b2 = rgb_to_lab(hex_to_rgb(hx))
+        d = math.sqrt(0.25 * (L1 - L2) ** 2 + (a1 - a2) ** 2 + (b1 - b2) ** 2)
+        if d < best_d:
+            best, best_d = name, d
+    return best
+
+
+def backup_once(path: Path):
+    bak = path.with_suffix(path.suffix + ".pre-rice")
+    if path.exists() and not bak.exists():
+        shutil.copy2(path, bak)
+        print(f"  backed up {path.name} -> {bak.name}")
+
+
+def remember_wallpaper(path: str, colors: dict, args) -> None:
+    """Pin the generated seed to this image so returning restores its look.
+
+    Image color extraction is intentionally heuristic. Persisting its result
+    also lets a manually seeded wallpaper keep that deliberate choice instead
+    of being re-extracted differently when the selector comes back to it.
+    """
+    if not path:
+        return
+    try:
+        profiles = json.loads(WALLPAPER_THEMES.read_text()) if WALLPAPER_THEMES.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        profiles = {}
+    key = str(Path(path).expanduser().resolve())
+    # Keep user-authored extras such as a wallpaper's GTK theme association.
+    # Palette extraction owns only the fields below; replacing the whole entry
+    # would silently discard the GTK mapping every time this wallpaper returns.
+    profile = profiles.get(key, {})
+    profile.update({
+        "seed": colors["source"],
+        "scheme": args.scheme,
+        "mode": args.mode,
+        "tint": args.tint,
+        "paper": args.paper,
+    })
+    profiles[key] = profile
+    WALLPAPER_THEMES.write_text(json.dumps(profiles, indent=2) + "\n")
+
+
+def ensure_kitty_include():
+    """Point kitty.conf at the generated theme instead of the static one."""
+    if not KITTY_CONF.exists():
+        return
+    text = KITTY_CONF.read_text()
+    if "include matugen-theme.conf" in text:
+        return
+    if "include hermes-theme.conf" in text:
+        backup_once(KITTY_CONF)
+        KITTY_CONF.write_text(
+            text.replace("include hermes-theme.conf", "include matugen-theme.conf"))
+        print("  kitty.conf now includes matugen-theme.conf "
+              "(hermes-theme.conf kept as a preset)")
+
+
+def patch_starship(colors):
+    """Rewrite the values inside starship's [palettes.*] block, nothing else."""
+    if not STARSHIP.exists():
+        return
+    text = STARSHIP.read_text()
+    mapping = {
+        "color_ink": colors["on_surface"],
+        "color_accent": colors["primary"],
+        "color_muted": colors.get("text_muted", colors["on_surface_variant"]),
+        "color_red": colors.get("red", colors["error"]),
+        "color_green": colors.get("green", colors["tertiary"]),
+    }
+    m = re.search(r"^\[palettes\.[\w-]+\]\s*$", text, re.M)
+    if not m:
+        return
+    start = m.end()
+    nxt = re.search(r"^\[", text[start:], re.M)
+    end = start + (nxt.start() if nxt else len(text) - start)
+    block, changed = text[start:end], False
+    for key, val in mapping.items():
+        block, n = re.subn(rf"^({key}\s*=\s*)'[^']*'", rf"\g<1>'{val}'",
+                           block, flags=re.M)
+        changed = changed or bool(n)
+    if changed:
+        backup_once(STARSHIP)
+        STARSHIP.write_text(text[:start] + block + text[end:])
+        print("  starship palette updated")
+
+
+def set_wallpaper(path: Path):
+    uri = path.resolve().as_uri()
+    for key in ("picture-uri", "picture-uri-dark"):
+        sh(["gsettings", "set", "org.gnome.desktop.background", key, uri])
+    sh(["gsettings", "set", "org.gnome.desktop.background", "picture-options", "zoom"])
+    print(f"  wallpaper -> {path.name}")
+
+
+def set_accent(colors):
+    # Snap from source_color, not primary: M3 primaries are pale pastels whose
+    # chroma is too low to match any named accent, so they all collapse onto
+    # 'slate'. The source color is the one that actually carries the hue.
+    basis = colors.get("source") or colors["primary"]
+    accent = nearest_accent(basis)
+    sh(["gsettings", "set", "org.gnome.desktop.interface", "accent-color", accent])
+    print(f"  shell accent -> {accent} (from {basis})")
+
+
+def ext_set(schemadir: Path, schema: str, key: str, value: str):
+    if not schemadir.exists():
+        return False
+    res = sh(["gsettings", "--schemadir", str(schemadir), "set", schema, key, value])
+    return res.returncode == 0
+
+
+def set_window_border(colors):
+    """Border and round every window, from whichever extension is available.
+
+    Rounded Window Corners Reborn is preferred and owns *both* the corner clip
+    and the border, because it draws the border along its own clip path — they
+    are guaranteed to agree. Tiling Shell's border only traces the window's
+    native radius, which for kitty means square bottom corners no matter what
+    the clipper does, so the two must not both be on.
+    """
+    if RWC_SCHEMAS.exists():
+        set_rounded_corners(colors)
+        # Hand the border over; two borders on one window read as a double line.
+        ext_set(TILINGSHELL_SCHEMAS, "org.gnome.shell.extensions.tilingshell",
+                "enable-window-border", "false")
+        return
+
+    if not TILINGSHELL_SCHEMAS.exists():
+        print("  window border -> skipped (no border extension installed)")
+        return
+    schema = "org.gnome.shell.extensions.tilingshell"
+    for key, value in (
+        ("enable-window-border", "true"),
+        ("window-use-custom-border-color", "true"),
+        ("window-border-color", f"'{colors['outline']}'"),
+        ("window-border-width", "1"),
+        ("inner-gaps", "8"),
+        ("outer-gaps", "6"),
+    ):
+        ext_set(TILINGSHELL_SCHEMAS, schema, key, value)
+    print(f"  window border -> {colors['primary']} (2px)")
+
+
+def set_rounded_corners(colors):
+    # kitty draws its own decorations and exposes no radius option, so the only
+    # way to round it is a compositor-level clip. This extension shapes every
+    # window regardless of toolkit, and `tweak-kitty-terminal` handles kitty's
+    # non-standard surface specifically.
+    schema = "org.gnome.shell.extensions.rounded-window-corners-reborn"
+    r, g, b = hex_to_rgb(colors["outline"])
+    border = f"[{r / 255:.4f}, {g / 255:.4f}, {b / 255:.4f}, 1.0]"
+
+    # One packed a{sv}; gsettings has no way to update a single member, so the
+    # whole dict is rewritten. Maximized and fullscreen keep square corners —
+    # they sit flush to the screen edge.
+    radius = rounded_radius()
+    settings = (
+        "{'padding': <{'left': <uint32 1>, 'right': <uint32 1>, "
+        "'top': <uint32 1>, 'bottom': <uint32 1>}>, "
+        "'keepRoundedCorners': <{'maximized': <false>, 'fullscreen': <false>}>, "
+        f"'borderRadius': <uint32 {radius}>, 'smoothing': <0>, "
+        f"'borderColor': <{border}>, 'enabled': <true>}}"
+    )
+    ext_set(RWC_SCHEMAS, schema, "global-rounded-corner-settings", settings)
+    ext_set(RWC_SCHEMAS, schema, "border-width", "1")
+    ext_set(RWC_SCHEMAS, schema, "tweak-kitty-terminal", "true")
+    # libadwaita apps round themselves, but skipping them means they alone would
+    # miss the border — so include them and let one extension style everything.
+    ext_set(RWC_SCHEMAS, schema, "skip-libadwaita-app", "false")
+    print(f"  window border -> {colors['outline']} (1px, {radius}px radius)")
+
+
+def reload_shell_theme():
+    # GNOME Shell only re-reads its stylesheet when the theme *name* changes,
+    # and on Wayland the shell can't be restarted. Blanking the name and
+    # setting it back forces a reparse of the regenerated CSS in place.
+    theme_dir = HOME / ".themes" / SHELL_THEME / "gnome-shell"
+    if not (theme_dir / "gnome-shell.css").exists():
+        print(f"  shell theme -> skipped (no {SHELL_THEME} theme yet)")
+        return
+    schema = "org.gnome.shell.extensions.user-theme"
+    if not ext_set(USER_THEME_SCHEMAS, schema, "name", "''"):
+        print("  shell theme -> skipped (user-theme extension unavailable)")
+        return
+    ext_set(USER_THEME_SCHEMAS, schema, "name", f"'{SHELL_THEME}'")
+    print(f"  shell theme -> {SHELL_THEME} (reloaded)")
+
+
+def reload_apps():
+    # kitty reload is a matugen post_hook; nudge any other live sockets too.
+    for sock in Path("/tmp").glob("kitty*"):
+        if sock.is_socket():
+            sh(["kitty", "@", "--to", f"unix:{sock}", "load-config"])
+    print("  reloaded live kitty instances")
+    reload_shell_theme()
+    hypr_reload = HOME / "rice/bin/hypr-reload"
+    if hypr_reload.exists():
+        sh([str(hypr_reload)])
+        print("  hyprland rice refreshed")
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("image", nargs="?", help="wallpaper to theme from")
+    ap.add_argument("--seed", help="theme from a hex color instead of an image")
+    ap.add_argument("--relight", action="store_true",
+                    help="re-apply the last palette")
+    ap.add_argument("--scheme", default="tonal-spot",
+                    help="matugen scheme variant (tonal-spot, vibrant, expressive, "
+                         "content, fidelity, neutral, monochrome, fruit-salad, rainbow)")
+    ap.add_argument("--mode", default="dark", choices=["dark", "light"])
+    ap.add_argument("--prefer", default="saturation",
+                    help="which extracted color to favor (saturation, darkness, "
+                         "lightness, value, less-saturation)")
+    ap.add_argument("--no-wallpaper", action="store_true",
+                    help="generate the palette but leave the desktop background alone")
+    ap.add_argument("--wallpaper", metavar="PATH",
+                    help="set this image as the background while taking the palette "
+                         "from --seed (used by `poster`, which already knows its "
+                         "own seed and shouldn't have it re-guessed from pixels)")
+    ap.add_argument("--tint", type=float, default=0.45, metavar="0..1",
+                    help="how far to pull surfaces toward the source hue "
+                         "(0 = stock Material You near-black, 1 = full hue). "
+                         "default 0.45")
+    ap.add_argument("--paper", type=float, default=0.0, metavar="L",
+                    help="light mode only: pull surfaces down the lightness axis "
+                         "by this many L* units, so a parchment seed renders as "
+                         "paper instead of Material's near-white. 0 disables")
+    args = ap.parse_args()
+    args.tint = max(0.0, min(1.0, args.tint))
+    args.paper = max(0.0, min(40.0, args.paper))
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+
+    if args.relight:
+        src = state.get("source")
+        if not src:
+            sys.exit("no previous palette to re-apply; run `retheme <image>` first")
+        args.image = src if state.get("kind") == "image" else None
+        args.seed = None if args.image else src
+        args.scheme = state.get("scheme", args.scheme)
+        args.mode = state.get("mode", args.mode)
+        args.tint = state.get("tint", args.tint)
+        args.paper = state.get("paper", args.paper)
+
+    if not args.image and not args.seed:
+        ap.error("give an image, a --seed color, or --relight")
+
+    ensure_kitty_include()
+
+    # Extraction must use a template-free config: the real templates reference
+    # semantic colors that don't exist until stage 2 adds them.
+    base = [MATUGEN, "-c", str(HOME / ".config/matugen/extract.toml"),
+            "-m", args.mode, "-t", f"scheme-{args.scheme}"]
+    if args.seed:
+        cmd = base + ["color", "hex", args.seed]
+        kind, source = "color", args.seed
+    else:
+        img = Path(args.image).expanduser()
+        if not img.exists():
+            sys.exit(f"no such image: {img}")
+        extraction_image, temporary = matugen_image_path(img)
+        cmd = base + ["image", str(extraction_image), "--prefer", args.prefer]
+        kind, source = "image", str(img)
+
+    print(f"palette from {kind}: {source}  [scheme-{args.scheme}, {args.mode}, "
+          f"tint {args.tint}" + (f", paper {args.paper}" if args.paper else "") + "]")
+
+    # Stage 1: extract the raw scheme as JSON without rendering anything.
+    res = sh(cmd + ["--json", "hex", "-q"])
+    if not args.seed and temporary is not None:
+        (temporary / extraction_image.name).unlink(missing_ok=True)
+        temporary.rmdir()
+    if res.returncode != 0:
+        sys.exit(f"matugen failed:\n{res.stderr}")
+    raw = json.loads(res.stdout)
+    src_hex = raw["colors"]["source_color"]["default"]["color"]
+
+    # Stage 2: tint surfaces toward the source hue.
+    tinted = tint_palette(raw, src_hex, args.tint)
+    if args.mode == "light":
+        tinted = paper_palette(tinted, args.paper)
+    tinted = add_accessible_text_roles(tinted, args.mode)
+    tinted = add_semantic_colors(tinted, args.mode)
+    tinted_path = STATE / "palette-tinted.json"
+    tinted_path.write_text(json.dumps(tinted))
+
+    # Stage 3: render every template from the adjusted palette.
+    res = sh([MATUGEN, "-m", args.mode, "json", str(tinted_path)])
+    if res.returncode != 0:
+        sys.exit(f"template render failed:\n{res.stderr}")
+
+    if not COLORS_JSON.exists():
+        sys.exit("matugen ran but produced no colors.json — check "
+                 "~/.config/matugen/config.toml")
+    colors = json.loads(COLORS_JSON.read_text())
+
+    print(f"  templates written (primary {colors['primary']}, "
+          f"surface {colors['surface']})")
+    wallpaper = state.get("wallpaper", "")
+    if args.wallpaper:
+        wallpaper = str(Path(args.wallpaper).expanduser().resolve())
+    elif kind == "image" and not args.no_wallpaper:
+        wallpaper = str(Path(source).expanduser().resolve())
+
+    # Hyprland's reload bridge reads this file to choose its swaybg image, so
+    # publish the new palette and wallpaper atomically before asking it to run.
+    STATE_FILE.write_text(json.dumps(
+        {"kind": kind, "source": source, "wallpaper": wallpaper,
+         "scheme": args.scheme, "mode": args.mode, "tint": args.tint,
+         "paper": args.paper, "colors": colors}, indent=2))
+    if not args.no_wallpaper:
+        remember_wallpaper(wallpaper, colors, args)
+
+    set_accent(colors)
+    set_window_border(colors)
+    patch_starship(colors)
+    if not args.no_wallpaper:
+        if args.wallpaper:
+            set_wallpaper(Path(args.wallpaper).expanduser())
+        elif kind == "image":
+            set_wallpaper(Path(source))
+    reload_apps()
+
+    print("done. GTK apps pick up the new palette as they restart.")
+
+
+if __name__ == "__main__":
+    main()

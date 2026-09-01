@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""theme — save and switch whole desktop themes.
+
+    theme                    # list profiles, marking the active one
+    theme <name>             # switch to a profile
+    theme toggle             # switch to the active profile's counterpart
+    theme save <name>        # snapshot the live desktop into a profile
+    theme current            # print the active profile name
+    theme show <name>        # print what a profile contains
+    theme diff <name>        # show which live settings differ from a profile
+
+A profile is everything that makes the desktop look the way it does: the
+palette seed and the matugen *templates* it renders through, the poster style,
+and the chrome settings that aren't palette-derived. Profiles live in
+~/.local/share/rice/themes/<name>/.
+
+Templates are part of a profile because a theme is not only a palette. The
+System 7 theme needs square corners, a light shell and a menu-bar panel — that
+is different template *text*, not different color values plugged into the same
+text. So each profile carries its own copy of ~/.config/matugen/templates/ and
+applying a profile installs them before re-rendering.
+
+Nothing here is destructive: `theme save` reads the live desktop, and applying
+a profile only writes files the rice already generates.
+"""
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+RICE = HOME / ".local/share/rice"
+THEMES = RICE / "themes"
+CURRENT = RICE / "current-theme"
+STATE_FILE = RICE / "state.json"
+POSTER_TOML = RICE / "poster.toml"
+
+MATUGEN_DIR = HOME / ".config/matugen"
+TEMPLATES = MATUGEN_DIR / "templates"
+MATUGEN_CONFIG = MATUGEN_DIR / "config.toml"
+
+EXT = HOME / ".local/share/gnome-shell/extensions"
+BLUR = EXT / "blur-my-shell@aunetx/schemas"
+JP = EXT / "just-perfection-desktop@just-perfection/schemas"
+RWC = EXT / "rounded-window-corners@fxgn/schemas"
+USER_THEME = EXT / "user-theme@gnome-shell-extensions.gcampax.github.com/schemas"
+TILING = EXT / "tilingshell@ferrarodomenico.com/schemas"
+
+# Every chrome setting a theme owns. `gsettings get` prints GVariant text and
+# `gsettings set` accepts the same text back, so values round-trip verbatim —
+# including the packed a{sv} dict that Rounded Window Corners uses, which has no
+# per-member accessor.
+#
+# (schemadir or None, schema, [keys...])
+KEYS = [
+    # `accent-color` is deliberately absent: retheme snaps it from the palette's
+    # source color on every apply. Pinning it in a profile would mean the
+    # profile and the palette disagree, and whichever ran last would win — so a
+    # plain `poster --apply` an hour later would silently change it back.
+    (None, "org.gnome.desktop.interface", [
+        "gtk-theme", "icon-theme", "cursor-theme", "color-scheme",
+        "font-name", "monospace-font-name", "document-font-name",
+        "font-hinting", "font-antialiasing",
+    ]),
+    # Window buttons stay disabled for Hyprland and are not theme state.
+    (None, "org.gnome.desktop.wm.preferences", ["titlebar-font"]),
+    (None, "org.gnome.desktop.background", [
+        "picture-options", "primary-color", "secondary-color", "color-shading-type",
+    ]),
+    (USER_THEME, "org.gnome.shell.extensions.user-theme", ["name"]),
+    (JP, "org.gnome.shell.extensions.just-perfection", [
+        "panel", "panel-in-overview", "top-panel-position", "panel-size",
+        "panel-button-padding-size", "panel-indicator-padding-size",
+        "panel-icon-size", "clock-menu-position", "clock-menu-position-offset",
+        "activities-button", "panel-notification-icon", "keyboard-layout",
+        "accessibility-menu", "power-icon", "workspace-background-corner-size",
+        "animation",
+    ]),
+    (BLUR, "org.gnome.shell.extensions.blur-my-shell.panel", [
+        "blur", "sigma", "brightness", "static-blur",
+    ]),
+    (BLUR, "org.gnome.shell.extensions.blur-my-shell.dash-to-dock", ["blur"]),
+    (BLUR, "org.gnome.shell.extensions.blur-my-shell.overview", ["sigma"]),
+    (None, "org.gnome.shell.extensions.dash-to-dock", [
+        "dock-fixed", "autohide", "intellihide", "dash-max-icon-size",
+        "background-opacity", "force-straight-corner", "custom-theme-shrink",
+        "show-trash", "show-mounts", "show-show-apps-button",
+    ]),
+    # `global-rounded-corner-settings` is handled separately by
+    # {read,write}_corner_radius: it is one packed a{sv} holding both the radius
+    # (which a theme owns) and the border color (which retheme derives from the
+    # palette). Capturing the whole dict would freeze the color too.
+    (RWC, "org.gnome.shell.extensions.rounded-window-corners-reborn", [
+        "border-width", "tweak-kitty-terminal", "skip-libadwaita-app",
+    ]),
+    (TILING, "org.gnome.shell.extensions.tilingshell", [
+        "enable-window-border", "window-use-custom-border-color",
+        "window-border-color", "window-border-width", "inner-gaps", "outer-gaps",
+    ]),
+]
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def gget(schemadir, schema, key):
+    cmd = ["gsettings"]
+    if schemadir:
+        if not Path(schemadir).exists():
+            return None
+        cmd += ["--schemadir", str(schemadir)]
+    res = sh(cmd + ["get", schema, key])
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def gset(schemadir, schema, key, value):
+    cmd = ["gsettings"]
+    if schemadir:
+        if not Path(schemadir).exists():
+            return False
+        cmd += ["--schemadir", str(schemadir)]
+    return sh(cmd + ["set", schema, key, value]).returncode == 0
+
+
+def schemadir_of(token):
+    """Map the manifest's stable token back to a live path."""
+    return {"blur": BLUR, "jp": JP, "rwc": RWC,
+            "user-theme": USER_THEME, "tiling": TILING}.get(token)
+
+
+def token_of(schemadir):
+    for token, path in (("blur", BLUR), ("jp", JP), ("rwc", RWC),
+                        ("user-theme", USER_THEME), ("tiling", TILING)):
+        if schemadir == path:
+            return token
+    return None
+
+
+RWC_SCHEMA = "org.gnome.shell.extensions.rounded-window-corners-reborn"
+RADIUS_RE = re.compile(r"('borderRadius': <uint32 )(\d+)(>)")
+
+
+def read_corner_radius():
+    raw = gget(RWC, RWC_SCHEMA, "global-rounded-corner-settings")
+    if not raw:
+        return None
+    m = RADIUS_RE.search(raw)
+    return int(m.group(2)) if m else None
+
+
+def write_corner_radius(radius):
+    """Rewrite only the radius member of the packed corner dict.
+
+    gsettings cannot address one member of an a{sv}, so the whole value has to
+    be written back — but it is read live first, which means retheme's freshly
+    derived border color survives instead of being replaced by whatever color
+    happened to be current when the profile was saved.
+    """
+    raw = gget(RWC, RWC_SCHEMA, "global-rounded-corner-settings")
+    if not raw or radius is None:
+        return False
+    new, n = RADIUS_RE.subn(rf"\g<1>{int(radius)}\g<3>", raw)
+    return bool(n) and gset(RWC, RWC_SCHEMA, "global-rounded-corner-settings", new)
+
+
+def capture_settings():
+    out = []
+    for schemadir, schema, keys in KEYS:
+        for key in keys:
+            value = gget(schemadir, schema, key)
+            if value is None:
+                continue        # extension not installed, or key gone
+            out.append({"schemadir": token_of(schemadir), "schema": schema,
+                        "key": key, "value": value})
+    return out
+
+
+def profile_dir(name):
+    return THEMES / name
+
+
+def load(name):
+    path = profile_dir(name) / "theme.json"
+    if not path.exists():
+        sys.exit(f"no such theme: {name}\n"
+                 f"have: {', '.join(sorted(p.name for p in THEMES.iterdir())) if THEMES.exists() else '(none)'}")
+    return json.loads(path.read_text())
+
+
+def current_name():
+    return CURRENT.read_text().strip() if CURRENT.exists() else None
+
+
+# ── save ──────────────────────────────────────────────────────────────────
+
+def cmd_save(args):
+    name = args.name
+    dest = profile_dir(name)
+    if dest.exists() and not args.force:
+        sys.exit(f"theme '{name}' already exists — pass --force to overwrite it")
+
+    if not STATE_FILE.exists():
+        sys.exit("no ~/.local/share/rice/state.json — run `retheme` at least once first")
+    state = json.loads(STATE_FILE.read_text())
+
+    existing = {}
+    if (dest / "theme.json").exists():
+        try:
+            existing = json.loads((dest / "theme.json").read_text())
+        except json.JSONDecodeError:
+            pass
+
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # The templates are the theme's *shape*; the palette is only its color.
+    if TEMPLATES.exists():
+        shutil.rmtree(dest / "templates", ignore_errors=True)
+        shutil.copytree(TEMPLATES, dest / "templates")
+    if MATUGEN_CONFIG.exists():
+        shutil.copy2(MATUGEN_CONFIG, dest / "matugen-config.toml")
+    if POSTER_TOML.exists():
+        shutil.copy2(POSTER_TOML, dest / "poster.toml")
+
+    manifest = {
+        "name": name,
+        "label": args.label or name,
+        # Carried over, not rebuilt: the pairing is a fact about two profiles
+        # and nothing on the live desktop records it, so re-saving a profile
+        # would otherwise silently break `theme toggle` in one direction.
+        **({"counterpart": existing["counterpart"]} if existing.get("counterpart") else {}),
+        "saved": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "palette": {
+            "kind": state.get("kind", "color"),
+            "source": state.get("source"),
+            "scheme": state.get("scheme", "tonal-spot"),
+            "mode": state.get("mode", "dark"),
+            "tint": state.get("tint", 0.45),
+            "paper": state.get("paper", 0.0),
+        },
+        # Anything else already under `poster` is carried over rather than
+        # rebuilt from the command line: `wall` writes the wallpaper list and
+        # the current selection there, and a re-save must not drop them.
+        "poster": {**existing.get("poster", {}),
+                   "style": args.style, "layout": args.layout},
+        "chrome": {"corner_radius": read_corner_radius()},
+        "settings": capture_settings(),
+    }
+    (dest / "theme.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    n = len(manifest["settings"])
+    print(f"saved theme '{name}' -> {dest}")
+    print(f"  palette   {manifest['palette']['source']} "
+          f"[scheme-{manifest['palette']['scheme']}, {manifest['palette']['mode']}, "
+          f"tint {manifest['palette']['tint']}]")
+    print(f"  poster    style {args.style}")
+    print(f"  templates {len(list((dest / 'templates').glob('*')))} files")
+    print(f"  chrome    {n} settings")
+    if current_name() is None:
+        CURRENT.write_text(name + "\n")
+        print(f"  marked '{name}' as the active theme")
+
+
+# ── apply ─────────────────────────────────────────────────────────────────
+
+def cmd_apply(args):
+    name = args.name
+    m = load(name)
+    src = profile_dir(name)
+
+    print(f"switching to '{m.get('label', name)}'")
+
+    # 1. Templates first — retheme renders through them, so they must be in
+    #    place before the palette pass runs.
+    if (src / "templates").exists():
+        TEMPLATES.mkdir(parents=True, exist_ok=True)
+        for f in TEMPLATES.iterdir():
+            if f.is_file():
+                f.unlink()
+        for f in (src / "templates").iterdir():
+            if f.is_file():
+                shutil.copy2(f, TEMPLATES / f.name)
+        print(f"  templates -> {len(list((src / 'templates').glob('*')))} installed")
+    if (src / "matugen-config.toml").exists():
+        shutil.copy2(src / "matugen-config.toml", MATUGEN_CONFIG)
+    if (src / "poster.toml").exists():
+        shutil.copy2(src / "poster.toml", POSTER_TOML)
+
+    # 2. Palette. --no-wallpaper because the poster pass below owns the
+    #    background; letting retheme set it too would flash the old image.
+    p = m["palette"]
+    cmd = ["retheme", "--scheme", p["scheme"], "--mode", p["mode"],
+           "--tint", str(p["tint"]), "--paper", str(p.get("paper", 0.0)),
+           "--no-wallpaper"]
+    cmd += [p["source"]] if p["kind"] == "image" else ["--seed", p["source"]]
+    res = subprocess.run(cmd)
+    if res.returncode != 0:
+        sys.exit("retheme failed — desktop left mid-switch; re-run to retry")
+
+    # 3. Chrome, *after* retheme: retheme writes its own defaults for the window
+    #    border and corner radius, and the profile's recorded values must win.
+    ok = bad = 0
+    for s in m.get("settings", []):
+        if gset(schemadir_of(s["schemadir"]), s["schema"], s["key"], s["value"]):
+            ok += 1
+        else:
+            bad += 1
+    radius = m.get("chrome", {}).get("corner_radius")
+    if radius is not None and write_corner_radius(radius):
+        ok += 1
+    print(f"  chrome    -> {ok} settings applied" + (f", {bad} skipped" if bad else ""))
+
+    # 4. Record the switch — before painting, not after. `poster` reads
+    #    current-theme to resolve everything it wasn't told explicitly, so
+    #    running it while the file still names the *previous* theme paints the
+    #    old theme's wallpaper. That was invisible while the two themes'
+    #    compositions differed enough for --style to cover it, and became
+    #    visible the moment two profiles shared a style and differed only in
+    #    which background field they select. By this line the palette and the
+    #    chrome are already the new theme's, so this is simply when the switch
+    #    has happened.
+    CURRENT.write_text(name + "\n")
+
+    # 5. Wallpaper.
+    if not args.no_wallpaper:
+        style = m.get("poster", {}).get("style", "collage")
+        pcmd = ["poster", "--style", style, "--set"]
+        if m.get("poster", {}).get("layout"):
+            pcmd += ["--layout", m["poster"]["layout"]]
+        res = subprocess.run(pcmd)
+        if res.returncode != 0:
+            print("  poster    -> FAILED (wallpaper left as-is)", file=sys.stderr)
+
+    # 6. The shell stylesheet was regenerated in step 2 but the chrome writes in
+    #    step 3 can change what it should look like, so force one more reparse.
+    reload_shell_theme()
+
+    print(f"now on '{name}'.")
+    print("GTK3 apps need a restart to pick up a corner-radius change; "
+          "newly-changed shell settings are live.")
+
+
+def reload_shell_theme():
+    schema = "org.gnome.shell.extensions.user-theme"
+    live = gget(USER_THEME, schema, "name")
+    if live is None:
+        return
+    gset(USER_THEME, schema, "name", "''")
+    gset(USER_THEME, schema, "name", live)
+
+
+# ── read-only commands ────────────────────────────────────────────────────
+
+def cmd_toggle(args):
+    """Switch to the active profile's counterpart.
+
+    A profile names its opposite in `counterpart`, which is how the light and
+    dark cuts of one look are paired — `deserted` and `deserted-dark` point at
+    each other. That is deliberately a manifest field rather than a naming
+    convention (`<name>-dark`): a pair is a claim that two profiles are the
+    same desktop at two lightnesses, and a suffix would make `theme toggle`
+    guess at that from a string, silently pairing anything that happened to be
+    named the right way.
+
+    Themes with no counterpart — `klein` has none — are not an error to be on;
+    toggling simply has nothing to switch to and says so.
+    """
+    name = current_name()
+    if not name:
+        sys.exit("no active theme recorded — `theme <name>` to switch to one")
+    other = load(name).get("counterpart")
+    if not other:
+        sys.exit(f"'{name}' has no counterpart to toggle to.\n"
+                 f"Pair it by adding \"counterpart\": \"<other>\" to both "
+                 f"{THEMES}/<name>/theme.json files.")
+    if not (profile_dir(other) / "theme.json").exists():
+        sys.exit(f"'{name}' names '{other}' as its counterpart, but no such "
+                 f"theme exists")
+    args.name = other
+    cmd_apply(args)
+
+
+def cmd_list(args):
+    if not THEMES.exists() or not any(THEMES.iterdir()):
+        print("no themes saved yet — `theme save <name>` snapshots the live desktop")
+        return
+    active = current_name()
+    for d in sorted(THEMES.iterdir()):
+        if not (d / "theme.json").exists():
+            continue
+        m = json.loads((d / "theme.json").read_text())
+        mark = "*" if d.name == active else " "
+        p = m["palette"]
+        print(f"{mark} {d.name:<12} {p['source']:<9} {p['mode']:<5} "
+              f"scheme-{p['scheme']:<12} poster:{m.get('poster', {}).get('style', '?'):<9} "
+              f"{m.get('label', '')}")
+
+
+def cmd_current(args):
+    name = current_name()
+    print(name if name else "(none recorded)")
+
+
+def cmd_show(args):
+    m = load(args.name)
+    print(json.dumps(m, indent=2))
+
+
+def cmd_diff(args):
+    m = load(args.name)
+    drift = 0
+    for s in m.get("settings", []):
+        live = gget(schemadir_of(s["schemadir"]), s["schema"], s["key"])
+        if live is None:
+            continue
+        if live != s["value"]:
+            drift += 1
+            print(f"{s['schema']} {s['key']}")
+            print(f"    profile: {s['value']}")
+            print(f"    live:    {live}")
+    want = m.get("chrome", {}).get("corner_radius")
+    live_r = read_corner_radius()
+    if want is not None and live_r is not None and want != live_r:
+        drift += 1
+        print(f"{RWC_SCHEMA} borderRadius\n    profile: {want}\n    live:    {live_r}")
+    print(f"{drift} setting(s) differ from '{args.name}'" if drift
+          else f"live desktop matches '{args.name}'")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="theme", add_help=True,
+                                 description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("save", help="snapshot the live desktop into a profile")
+    s.add_argument("name")
+    s.add_argument("--label", help="one-line description")
+    s.add_argument("--style", default="collage", help="poster style this theme renders")
+    s.add_argument("--layout", help="poster --layout to pass (legacy)")
+    s.add_argument("--force", action="store_true", help="overwrite an existing profile")
+    s.set_defaults(func=cmd_save)
+
+    s = sub.add_parser("apply", help="switch to a profile")
+    s.add_argument("name")
+    s.add_argument("--no-wallpaper", action="store_true")
+    s.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("toggle", help="switch to the active theme's counterpart")
+    s.add_argument("--no-wallpaper", action="store_true")
+    s.set_defaults(func=cmd_toggle)
+
+    s = sub.add_parser("list", help="list profiles")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("current", help="print the active profile")
+    s.set_defaults(func=cmd_current)
+
+    s = sub.add_parser("show", help="print a profile manifest")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("diff", help="show live settings that drifted from a profile")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_diff)
+
+    # retheme and poster write straight to the terminal; without this our own
+    # progress lines sit in a block buffer and surface after theirs, making the
+    # switch read as if it happened in the wrong order.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
+    # `theme` alone lists; `theme <name>` switches, without needing `apply`.
+    argv = sys.argv[1:]
+    if not argv:
+        return cmd_list(None)
+    if argv[0] not in {"save", "apply", "list", "current", "show", "diff",
+                       "toggle", "-h", "--help"}:
+        argv = ["apply"] + argv
+
+    args = ap.parse_args(argv)
+    if not getattr(args, "func", None):
+        return cmd_list(None)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

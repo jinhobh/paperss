@@ -1,0 +1,7 @@
+# Template-free config used for the extraction pass of `retheme`.
+# Stage 1 only needs the raw scheme as JSON; rendering happens in stage 3,
+# after the palette has been tinted and given its semantic colors.
+[config]
+
+# matugen requires this key to be present, even when empty.
+[templates]
