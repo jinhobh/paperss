@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small, keyboard-first wallpaper switcher for the Rice Hyprland desktop.
+"""A small, keyboard-first wallpaper switcher for the Paperss Hyprland desktop.
 
 The first invocation opens the strip and advances once, like Alt-Tab. Further
 invocations are routed to the same Gtk application and advance again. Release
@@ -31,10 +31,6 @@ COLORS = HOME / ".local/share/rice/colors.json"
 WALLPAPER_THEMES = HOME / ".local/share/rice/wallpaper-themes.json"
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 LOG = RUNTIME / "rice-wallpaper-selector.log"
-GTK3_SETTINGS = HOME / ".config/gtk-3.0/settings.ini"
-GTK4_SETTINGS = HOME / ".config/gtk-4.0/settings.ini"
-GTK3_CSS = HOME / ".config/gtk-3.0/gtk.css"
-DEFAULT_GTK_THEME = "Adwaita"
 THUMBNAIL_WIDTH = 900
 THUMBNAIL_HEIGHT = 600
 CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
@@ -152,93 +148,6 @@ def retheme_command(retheme: Path, selected: Path) -> list[str]:
     return command
 
 
-def set_gtk_dark_preference(prefer_dark: bool) -> None:
-    """Keep the GTK 3 and GTK 4 per-user preferences in lockstep."""
-    value = "1" if prefer_dark else "0"
-    for settings in (GTK3_SETTINGS, GTK4_SETTINGS):
-        try:
-            lines = settings.read_text().splitlines()
-        except OSError:
-            lines = ["[Settings]"]
-
-        key = "gtk-application-prefer-dark-theme"
-        replacement = f"{key}={value}"
-        for index, line in enumerate(lines):
-            if line.strip().startswith(f"{key}="):
-                lines[index] = replacement
-                break
-        else:
-            lines.append(replacement)
-
-        settings.parent.mkdir(parents=True, exist_ok=True)
-        settings.write_text("\n".join(lines) + "\n")
-
-
-def apply_wallpaper_gtk(selected: Path) -> str:
-    """Apply the optional GTK profile associated with a wallpaper.
-
-    `retheme` has already regenerated the user CSS by the time this runs.  A
-    mapped supplement is therefore inserted afterwards and naturally vanishes
-    on the next, unmapped wallpaper switch.
-    """
-    profile = read_json(WALLPAPER_THEMES).get(str(selected.resolve()), {})
-    prefer_dark = bool(profile.get("gtk_prefer_dark", profile.get("mode", "dark") == "dark"))
-    theme = profile.get(
-        "gtk_theme",
-        f"{DEFAULT_GTK_THEME}-dark" if prefer_dark else DEFAULT_GTK_THEME,
-    )
-
-    supplement = profile.get("gtk_css")
-    if supplement:
-        css_path = Path(supplement).expanduser()
-        if not css_path.is_file():
-            raise OSError(f"GTK supplement does not exist: {css_path}")
-        try:
-            generated = GTK3_CSS.read_text()
-        except OSError as exc:
-            raise OSError(f"could not read generated GTK CSS: {exc}") from exc
-        marker = f'@import url("{css_path.resolve().as_uri()}");\n'
-        if marker not in generated:
-            GTK3_CSS.write_text(marker + generated)
-
-    set_gtk_dark_preference(prefer_dark)
-    result = subprocess.run(
-        ["gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", theme],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
-    )
-    if result.returncode:
-        raise OSError(result.stdout.strip() or f"could not select GTK theme {theme}")
-    subprocess.run(
-        ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme",
-         "prefer-dark" if prefer_dark else "prefer-light"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-    )
-
-    # Hyprland was previously launched with a fixed GTK_THEME variable, which
-    # overrides gsettings. Update the compositor's environment so newly opened
-    # applications see the wallpaper-specific theme too, and mirror it into
-    # the D-Bus/systemd activation environment for applications launched there.
-    gtk_environment = profile.get(
-        "gtk_environment",
-        f"{DEFAULT_GTK_THEME}:dark" if theme == f"{DEFAULT_GTK_THEME}-dark" else
-        theme + (":dark" if prefer_dark and not theme.endswith("-dark") else ""),
-    )
-    subprocess.run(
-        ["hyprctl", "keyword", "env", f"GTK_THEME,{gtk_environment}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-    )
-    activation_env = os.environ.copy()
-    activation_env["GTK_THEME"] = gtk_environment
-    subprocess.run(
-        ["dbus-update-activation-environment", "--systemd", "GTK_THEME"],
-        env=activation_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        check=False,
-    )
-
-    suffix = f" + {Path(supplement).name}" if supplement else ""
-    return f"GTK theme -> {theme}{suffix}\n"
-
-
 def current_wallpaper(items: list[Path]) -> int:
     state = read_json(STATE)
     raw = state.get("wallpaper") or (state.get("source") if state.get("kind") == "image" else "")
@@ -259,7 +168,7 @@ def rgb(hex_color: str, alpha: float = 1.0) -> tuple[float, float, float, float]
 
 class SelectorWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application, items: list[Path]):
-        super().__init__(application=app, title="Rice Wallpaper Selector")
+        super().__init__(application=app, title="Paperss Wallpaper Selector")
         self.items = items
         self.index = current_wallpaper(items)
         self.applying = False
@@ -401,7 +310,7 @@ class SelectorWindow(Gtk.ApplicationWindow):
     def _apply(self, selected: Path) -> None:
         retheme = HOME / ".local/bin/retheme"
         if not retheme.exists():
-            retheme = HOME / "rice/bin/retheme"
+            retheme = Path(__file__).with_name("retheme")
         try:
             result = subprocess.run(
                 retheme_command(retheme, selected), text=True,
@@ -411,8 +320,7 @@ class SelectorWindow(Gtk.ApplicationWindow):
                 LOG.write_text(result.stdout)
                 GLib.idle_add(self.apply_failed, f"retheme exited {result.returncode}")
             else:
-                gtk_output = apply_wallpaper_gtk(selected)
-                LOG.write_text(result.stdout + gtk_output)
+                LOG.write_text(result.stdout)
                 GLib.idle_add(self.close)
         except OSError as exc:
             GLib.idle_add(self.apply_failed, str(exc))

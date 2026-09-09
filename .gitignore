@@ -1,18 +1,2 @@
-# The impasto field is a cache: `poster` repaints it whenever the palette
-# changes and it is several megabytes of pure derivation. The two-tone
-# `pines-01-*` files next to it are not — they are the artwork `poster`
-# actually consumes, and the ImageMagick invocation that made them is not
-# recorded anywhere, so they are tracked.
-share/art/processed/impasto-field.png
-share/art/processed/impasto-field.json
-
-# The clips the plate figure opens. Deliberately not tracked: no theme profile
-# names them, `plates.js` just reads whatever is in the directory, so the rice
-# works without them — and they are ~22MB of collected media that git would
-# keep forever. The code and the click-point config *are* tracked; only the
-# content is not. Drop clips back in ~/.local/share/rice/art/.plates/ and the
-# figure picks them up.
-share/art/.plates/
-
 __pycache__/
 *.pyc

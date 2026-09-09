@@ -1,91 +1,127 @@
-# rice
+# Paperss
 
-One palette drives a whole GNOME desktop. A seed color — or an image — becomes
-the terminal, the GTK apps, the shell chrome, the window borders and a
-generated root-window composition, all from a single command.
+Paperss is a keyboard-first wallpaper switcher for Hyprland. It previews a
+curated wallpaper collection, applies the selected image through `swaybg`, and
+derives a matching desktop palette from the same image.
 
-Three saved looks, switchable at any time:
+Press **Super+Shift+Tab** to open the selector. Keep tapping the shortcut, use
+Tab/Shift+Tab or the arrow keys to move, then release Super or press Enter to
+apply. Escape cancels.
 
-| theme | what it looks like |
-| --- | --- |
-| `klein` | grayscale, dark, a root-window collage, micro-panel at the bottom |
-| `deserted` | parchment and ink, System 7 windows and a menu bar at the top, over a painting you can cycle |
-| `deserted-dark` | the same desktop unlit — espresso surfaces, cream lettering, the painting printed in negative |
+## What it does
 
-`deserted` and `deserted-dark` are a pair: one seed, one scheme, one tint,
-generated on the two sides of the lightness axis. `theme toggle` flips them, and
-so does a 7px dot in the menu bar.
+- GTK 4 fullscreen preview strip with cached, asynchronous thumbnails.
+- `swaybg` wallpaper application through Hyprland.
+- Material You palette extraction through Matugen.
+- Per-wallpaper saved color profiles, so returning to an image restores its
+  previous palette instead of re-extracting it.
+- Automatic color updates for:
+  - Hyprland
+  - GTK 3 and GTK 4
+  - Kitty
+  - Waybar
+  - Wofi
+  - Mako
+  - Firefox/Re:fox and pywalfox when installed
+  - Spotify/Spicetify when installed
 
-```
-theme                  # list themes, * marks the active one
-theme deserted         # switch
-theme toggle           # switch to the active theme's counterpart
-retheme <image>        # build a palette from an image and apply it everywhere
-wallpaper-selector     # Super+Shift+Tab preview strip; release Super to apply
-poster                 # repaint the root window
-wall                   # cycle the painting behind the deserted composition
-todo <text>            # add a task; the wallpaper paints the list
-```
+There is no GNOME Shell integration or theme-profile system in this project.
 
-**[share/README.md](share/README.md) is the real documentation** — how a
-retheme flows, why the tint and paper stages exist, what a theme profile may
-and may not pin, and the traps that are easy to reintroduce.
-
-## Hyprland companion
-
-The Hyprland configuration at `~/.config/hypr/hyprland.conf` uses the same
-Rice palette for its borders, Waybar, Wofi, and Mako. `retheme` invokes
-`hypr-reload` after every palette change, so those surfaces follow the active
-theme without a second colour command.
-
-`Super+Shift+Tab` opens a translucent parallelogram preview strip. Tap it again,
-use Tab/Shift+Tab, or use the arrow keys to move; release Super (or press Enter)
-to apply. The selector reads only `~/Pictures/Wallpapers` (or
-`$RICE_WALLPAPER_DIR` when set). The chosen image is passed to `retheme`, so
-swaybg and every generated color consumer change as one operation. Its
-generated seed is remembered in `~/.local/share/rice/wallpaper-themes.json`;
-returning to an image therefore restores the same palette instead of running
-the image-extraction heuristic again.
-
-## Install
+## Commands
 
 ```sh
-git clone <this repo> ~/rice && ~/rice/install.sh
+wallpaper-selector                 # open the preview selector
+retheme ~/Pictures/wallpaper.png   # apply an image and derive its palette
+retheme --relight                  # re-apply the last palette
+retheme --seed '#284d5d'           # derive a palette without extracting an image
+hypr-reload                        # regenerate live client files from colors.json
 ```
 
-`install.sh` symlinks this checkout into the paths the desktop reads from, and
-prints what else you need. It refuses to clobber anything that isn't already a
-link into the repo; `--force` moves the obstruction aside with a dated backup
-first.
+The selector is normally launched by this Hyprland binding:
 
-## Layout
-
-```
-bin/                 the commands: theme, retheme, poster, wall, todo, …
-matugen/             extract.toml — the template-free config retheme's first pass uses
-share/README.md      the long documentation
-share/lib/           shared python the commands import
-share/themes/<name>/ a theme profile: palette, poster style, chrome settings,
-                     and its own copy of the matugen templates
-share/art/           source artwork and the paintings the deserted theme cycles
-extensions/          two small GNOME Shell extensions
+```ini
+bind = $mainMod SHIFT, Tab, exec, wallpaper-selector
 ```
 
-### What is here and what is not
+Set `RICE_WALLPAPER_DIR` to use a different wallpaper directory. Otherwise the
+selector reads `~/Pictures/Wallpapers`.
 
-A theme is not just a palette, so a profile is not just a seed color. Each one
-under `share/themes/` carries its own `templates/` — the System 7 look needs
-square corners, a light shell and an ink menu bar, and that is different
-template *text*, not different values plugged into the same text.
+## Palette flow
 
-Which is why three live paths are **not** tracked, even though they look like
-configuration: `~/.config/matugen/config.toml`, `~/.config/matugen/templates/`
-and `~/.local/share/rice/poster.toml`. `theme apply` installs all three from
-the active profile every time you switch. They are output, not input — tracking
-them would mean every theme switch produced a diff that said nothing.
+```text
+selected image
+     │
+     ├──► saved profile lookup
+     │
+     ▼
+retheme ──► Matugen extracts a Material You palette
+     │
+     ├──► tint and accessibility adjustments
+     ├──► GTK 3/4 and Kitty templates
+     └──► colors.json
+                    │
+                    ▼
+             hypr-reload
+                    │
+                    ├──► Hyprland
+                    ├──► Waybar, Wofi, Mako
+                    ├──► Firefox/Re:fox and pywalfox
+                    ├──► Spotify/Spicetify
+                    └──► swaybg
+```
 
-Also not tracked, and staying on the machine where they belong: the generated
-palette (`colors.json`, `state.json`, `current-theme`, the rendered GTK and
-shell CSS) and your own data — the todo list and the activity summaries the
-wallpaper paints. The composition is in the repo; what it happens to say about
-today is not.
+`retheme` writes the selected wallpaper and palette state before invoking
+`hypr-reload`, so the wallpaper and generated colors change as one operation.
+
+## Saved profiles and cache
+
+Runtime state intentionally stays outside the repository:
+
+```text
+~/.local/share/rice/state.json
+~/.local/share/rice/colors.json
+~/.local/share/rice/wallpaper-themes.json
+~/.cache/rice/wallpaper-thumbnails/
+```
+
+The `rice` state directory name is retained for compatibility with existing
+Hyprland and user configuration paths. Each wallpaper profile stores its
+palette seed, Matugen scheme, light/dark mode, tint, and paper settings.
+Thumbnail cache entries are invalidated when the source file changes.
+
+## Installation
+
+```sh
+git clone https://github.com/jinhobh/paperss.git ~/paperss
+cd ~/paperss
+./install.sh
+```
+
+The installer symlinks the three commands and the Matugen configuration into
+the locations used by the desktop. Use `./install.sh --force` to move existing
+non-symlink files aside with a dated backup.
+
+Required runtime pieces:
+
+- Python 3
+- `python3-gi`, `python3-cairo`
+- GTK 4 introspection data
+- Matugen
+- `swaybg`
+- Hyprland
+- Kitty, Waybar, Wofi, and Mako
+
+Firefox/Re:fox, pywalfox, and Spicetify are optional integrations. If they are
+not installed, their update steps are skipped.
+
+## Repository layout
+
+```text
+bin/wallpaper-selector       GTK 4 preview and selection UI
+bin/retheme                  palette extraction and profile application
+bin/hypr-reload              generated client files and swaybg bridge
+matugen/config.toml          tracked Matugen target configuration
+matugen/extract.toml         template-free extraction configuration
+matugen/templates/           GTK, Kitty, and colors.json templates
+install.sh                   symlink installer
+```
