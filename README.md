@@ -10,7 +10,8 @@ apply. Escape cancels.
 
 ## What it does
 
-- GTK 4 fullscreen preview strip with cached, asynchronous thumbnails.
+- Native GTK 4 fullscreen preview strip written in C, with cached,
+  asynchronous thumbnails.
 - `swaybg` wallpaper application through Hyprland.
 - Material You palette extraction through Matugen.
 - Per-wallpaper saved color profiles, so returning to an image restores its
@@ -97,15 +98,18 @@ cd ~/paperss
 ./install.sh
 ```
 
-The installer symlinks the three commands and the Matugen configuration into
-the locations used by the desktop. Use `./install.sh --force` to move existing
-non-symlink files aside with a dated backup.
+The installer compiles the C selector, places it under
+`~/.local/libexec/paperss/`, and symlinks the three commands and Matugen
+configuration into the locations used by the desktop. Use
+`./install.sh --force` to move existing non-symlink files aside with a dated
+backup.
 
 Required runtime pieces:
 
 - Python 3
-- `python3-gi`, `python3-cairo`
-- GTK 4 introspection data
+- GTK 4 and GDK Pixbuf development packages (`libgtk-4-dev`,
+  `libgdk-pixbuf-2.0-dev`)
+- `pkg-config` and a C compiler
 - Matugen
 - `swaybg`
 - Hyprland
@@ -117,11 +121,12 @@ not installed, their update steps are skipped.
 ## Repository layout
 
 ```text
-bin/wallpaper-selector       GTK 4 preview and selection UI
+src/wallpaper-selector.c     native GTK 4 preview and selection UI
+bin/wallpaper-selector       stable launcher for the compiled selector
 bin/retheme                  palette extraction and profile application
 bin/hypr-reload              generated client files and swaybg bridge
 matugen/config.toml          tracked Matugen target configuration
 matugen/extract.toml         template-free extraction configuration
 matugen/templates/           GTK, Kitty, and colors.json templates
-install.sh                   symlink installer
+install.sh                   build and symlink installer
 ```

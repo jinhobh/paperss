@@ -18,6 +18,31 @@ made=0
 kept=0
 skipped=0
 
+build_selector() {
+    command -v cc >/dev/null 2>&1 || {
+        echo "cc is required to build the C wallpaper selector" >&2
+        exit 1
+    }
+    command -v pkg-config >/dev/null 2>&1 || {
+        echo "pkg-config is required to build the C wallpaper selector" >&2
+        exit 1
+    }
+    pkg-config --exists gtk4 gdk-pixbuf-2.0 || {
+        echo "GTK4 development packages are required (gtk4 and gdk-pixbuf-2.0)" >&2
+        exit 1
+    }
+
+    local output="$HOME/.local/libexec/paperss/wallpaper-selector"
+    local temporary="$output.tmp.$$"
+    mkdir -p "$(dirname "$output")"
+    echo "building C selector -> $output"
+    cc -std=c11 -O2 -Wall -Wextra -Wno-deprecated-declarations \
+        "$REPO/src/wallpaper-selector.c" \
+        $(pkg-config --cflags --libs gtk4 gdk-pixbuf-2.0) \
+        -lm -o "$temporary"
+    mv "$temporary" "$output"
+}
+
 link() {  # link <source-in-repo> <destination>
     local src="$1" dst="$2"
 
@@ -45,6 +70,7 @@ link() {  # link <source-in-repo> <destination>
 }
 
 echo "linking Paperss from $REPO"
+build_selector
 mkdir -p "$RICE"
 
 for script in wallpaper-selector retheme hypr-reload; do
@@ -67,9 +93,9 @@ fi
 
 cat <<'NEXT'
 
-Dependencies:
-  Python 3, python3-gi, python3-cairo, GTK 4 introspection data, Matugen,
-  swaybg, Hyprland, Kitty, Waybar, Wofi, and Mako.
+Build/runtime dependencies:
+  C compiler, pkg-config, GTK 4 development files, GDK Pixbuf development
+  files, Python 3, Matugen, swaybg, Hyprland, Kitty, Waybar, Wofi, and Mako.
 
 Optional integrations:
   Firefox/Re:fox and pywalfox, plus Spotify/Spicetify.
