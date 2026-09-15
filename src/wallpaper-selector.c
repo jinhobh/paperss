@@ -499,10 +499,12 @@ static void draw_card(Selector *selector, cairo_t *cr, const gchar *path,
                       gint delta, gdouble width, gdouble height)
 {
     gboolean selected = delta == 0;
+    gint distance = abs(delta);
     gdouble base_width = MIN(570.0, width * 0.42);
-    gdouble card_width = selected ? base_width : base_width * 0.80;
+    gdouble card_scale = selected ? 1.0 : (distance == 1 ? 0.68 : 0.50);
+    gdouble card_width = base_width * card_scale;
     gdouble card_height = card_width * 0.58;
-    gdouble step = base_width * 0.66;
+    gdouble step = base_width * 0.90;
     gdouble x = width / 2.0 - card_width / 2.0 + delta * step;
     gdouble y = height / 2.0 - card_height / 2.0 + (selected ? 0 : 15);
     gdouble slant = card_width * 0.13;
