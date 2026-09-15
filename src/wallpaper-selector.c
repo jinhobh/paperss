@@ -581,7 +581,7 @@ static void draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     for (guint pass = 0; pass < 2; pass++) {
         for (guint i = 0; i < visible->len; i++) {
             gint delta = g_array_index(visible, gint, i);
-            if ((pass == 0 && delta == 0) || (pass == 1 && delta != 0)) {
+            if ((pass == 0 && delta != 0) || (pass == 1 && delta == 0)) {
                 guint index = (selector->index + selector->items->len + delta) %
                               selector->items->len;
                 draw_card(selector, cr, g_ptr_array_index(selector->items, index),

@@ -339,7 +339,10 @@ def reload_apps():
 
     helper = HOME / ".local/bin/hypr-reload"
     if not helper.exists():
-        helper = Path(__file__).with_name("hypr-reload")
+        # `retheme` is commonly invoked through ~/.local/bin/retheme, which is
+        # a symlink. Resolve it before looking beside the script so the repo's
+        # Hyprland bridge is found even before reinstalling all links.
+        helper = Path(__file__).resolve().with_name("hypr-reload")
     if helper.exists():
         sh([str(helper)])
         print("  desktop clients and swaybg refreshed")
