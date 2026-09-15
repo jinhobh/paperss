@@ -1,8 +1,0 @@
-{
-  "uuid": "rice-daynight@jinho",
-  "name": "Day / Night",
-  "description": "One small dot in the menu bar that switches the desktop between a theme and its counterpart — `deserted` and `deserted-dark`. Runs the local `theme` command and reads the palette off disk; nothing else happens and nothing leaves the machine.",
-  "shell-version": ["48", "49", "50"],
-  "settings-schema": "",
-  "url": ""
-}

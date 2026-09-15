@@ -66,7 +66,8 @@ KEYS = [
         "font-name", "monospace-font-name", "document-font-name",
         "font-hinting", "font-antialiasing",
     ]),
-    (None, "org.gnome.desktop.wm.preferences", ["titlebar-font", "button-layout"]),
+    # Window buttons stay disabled for Hyprland and are not theme state.
+    (None, "org.gnome.desktop.wm.preferences", ["titlebar-font"]),
     (None, "org.gnome.desktop.background", [
         "picture-options", "primary-color", "secondary-color", "color-shading-type",
     ]),

@@ -1,8 +1,0 @@
-{
-  "uuid": "rice-timeline@jinho",
-  "name": "Root Window Status",
-  "description": "Compact workspace and activity indicators for the bottom micro-panel, plus a now/playing element drawn on the root window while media is playing. Reads the local timeline tracker and the session bus; no data leaves the machine.",
-  "shell-version": ["48", "49", "50"],
-  "settings-schema": "",
-  "url": ""
-}

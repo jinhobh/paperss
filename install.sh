@@ -88,7 +88,8 @@ cat <<'NEXT'
 Next, on a fresh machine:
 
   1. Install what the rice shells out to: matugen, kitty, ImageMagick,
-     python3-pil, and the GNOME extensions the themes drive (Just Perfection,
+     python3-pil, python3-gi, python3-cairo, GTK 4 introspection data, and the
+     GNOME extensions the themes drive (Just Perfection,
      Blur my Shell, User Themes, Rounded Window Corners Reborn, Tiling Shell,
      Dash to Dock).
   2. Enable the two extensions from this repo:

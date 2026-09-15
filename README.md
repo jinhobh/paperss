@@ -21,6 +21,7 @@ theme                  # list themes, * marks the active one
 theme deserted         # switch
 theme toggle           # switch to the active theme's counterpart
 retheme <image>        # build a palette from an image and apply it everywhere
+wallpaper-selector     # Super+Shift+Tab preview strip; release Super to apply
 poster                 # repaint the root window
 wall                   # cycle the painting behind the deserted composition
 todo <text>            # add a task; the wallpaper paints the list
@@ -29,6 +30,22 @@ todo <text>            # add a task; the wallpaper paints the list
 **[share/README.md](share/README.md) is the real documentation** — how a
 retheme flows, why the tint and paper stages exist, what a theme profile may
 and may not pin, and the traps that are easy to reintroduce.
+
+## Hyprland companion
+
+The Hyprland configuration at `~/.config/hypr/hyprland.conf` uses the same
+Rice palette for its borders, Waybar, Wofi, and Mako. `retheme` invokes
+`hypr-reload` after every palette change, so those surfaces follow the active
+theme without a second colour command.
+
+`Super+Shift+Tab` opens a translucent parallelogram preview strip. Tap it again,
+use Tab/Shift+Tab, or use the arrow keys to move; release Super (or press Enter)
+to apply. The selector reads only `~/Pictures/Wallpapers` (or
+`$RICE_WALLPAPER_DIR` when set). The chosen image is passed to `retheme`, so
+swaybg and every generated color consumer change as one operation. Its
+generated seed is remembered in `~/.local/share/rice/wallpaper-themes.json`;
+returning to an image therefore restores the same palette instead of running
+the image-extraction heuristic again.
 
 ## Install
 

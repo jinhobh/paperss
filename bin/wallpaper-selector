@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""A small, keyboard-first wallpaper switcher for the Rice Hyprland desktop.
+
+The first invocation opens the strip and advances once, like Alt-Tab. Further
+invocations are routed to the same Gtk application and advance again. Release
+Super, press Enter, or click the selected card to apply it; Escape cancels.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+
+HOME = Path.home()
+STATE = HOME / ".local/share/rice/state.json"
+COLORS = HOME / ".local/share/rice/colors.json"
+WALLPAPER_THEMES = HOME / ".local/share/rice/wallpaper-themes.json"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+LOG = RUNTIME / "rice-wallpaper-selector.log"
+GTK3_SETTINGS = HOME / ".config/gtk-3.0/settings.ini"
+GTK4_SETTINGS = HOME / ".config/gtk-4.0/settings.ini"
+GTK3_CSS = HOME / ".config/gtk-3.0/gtk.css"
+DEFAULT_GTK_THEME = "Adwaita"
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def wallpapers() -> list[Path]:
+    """Return only the user's deliberately curated wallpaper collection."""
+    configured = os.environ.get("RICE_WALLPAPER_DIR")
+    user_dir = Path(configured).expanduser() if configured else HOME / "Pictures/Wallpapers"
+
+    def is_image(path: Path) -> bool:
+        try:
+            # Ask the shared-mime database using both the name and the file
+            # header. This keeps extensionless images such as `sunset art`
+            # without accidentally presenting arbitrary files as wallpapers.
+            with path.open("rb") as source:
+                header = source.read(4096)
+            content_type, _uncertain = Gio.content_type_guess(str(path), header)
+            return content_type.startswith("image/")
+        except OSError:
+            return False
+
+    def images(root: Path) -> list[Path]:
+        if not root.is_dir():
+            return []
+        try:
+            return sorted(
+                (p.resolve() for p in root.iterdir()
+                 if p.is_file() and is_image(p)),
+                key=lambda p: p.name.casefold(),
+            )
+        except OSError:
+            return []
+
+    return images(user_dir)
+
+
+def retheme_command(retheme: Path, selected: Path) -> list[str]:
+    """Restore a wallpaper's remembered palette, or extract it the first time."""
+    profile = read_json(WALLPAPER_THEMES).get(str(selected.resolve()), {})
+    seed = profile.get("seed")
+    if not seed:
+        return [str(retheme), str(selected)]
+
+    command = [str(retheme), "--seed", seed, "--wallpaper", str(selected)]
+    for option in ("scheme", "mode", "tint", "paper"):
+        value = profile.get(option)
+        if value is not None:
+            command += [f"--{option}", str(value)]
+    return command
+
+
+def set_gtk_dark_preference(prefer_dark: bool) -> None:
+    """Keep the GTK 3 and GTK 4 per-user preferences in lockstep."""
+    value = "1" if prefer_dark else "0"
+    for settings in (GTK3_SETTINGS, GTK4_SETTINGS):
+        try:
+            lines = settings.read_text().splitlines()
+        except OSError:
+            lines = ["[Settings]"]
+
+        key = "gtk-application-prefer-dark-theme"
+        replacement = f"{key}={value}"
+        for index, line in enumerate(lines):
+            if line.strip().startswith(f"{key}="):
+                lines[index] = replacement
+                break
+        else:
+            lines.append(replacement)
+
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text("\n".join(lines) + "\n")
+
+
+def apply_wallpaper_gtk(selected: Path) -> str:
+    """Apply the optional GTK profile associated with a wallpaper.
+
+    `retheme` has already regenerated the user CSS by the time this runs.  A
+    mapped supplement is therefore inserted afterwards and naturally vanishes
+    on the next, unmapped wallpaper switch.
+    """
+    profile = read_json(WALLPAPER_THEMES).get(str(selected.resolve()), {})
+    prefer_dark = bool(profile.get("gtk_prefer_dark", profile.get("mode", "dark") == "dark"))
+    theme = profile.get(
+        "gtk_theme",
+        f"{DEFAULT_GTK_THEME}-dark" if prefer_dark else DEFAULT_GTK_THEME,
+    )
+
+    supplement = profile.get("gtk_css")
+    if supplement:
+        css_path = Path(supplement).expanduser()
+        if not css_path.is_file():
+            raise OSError(f"GTK supplement does not exist: {css_path}")
+        try:
+            generated = GTK3_CSS.read_text()
+        except OSError as exc:
+            raise OSError(f"could not read generated GTK CSS: {exc}") from exc
+        marker = f'@import url("{css_path.resolve().as_uri()}");\n'
+        if marker not in generated:
+            GTK3_CSS.write_text(marker + generated)
+
+    set_gtk_dark_preference(prefer_dark)
+    result = subprocess.run(
+        ["gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", theme],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+    )
+    if result.returncode:
+        raise OSError(result.stdout.strip() or f"could not select GTK theme {theme}")
+    subprocess.run(
+        ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme",
+         "prefer-dark" if prefer_dark else "prefer-light"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+
+    # Hyprland was previously launched with a fixed GTK_THEME variable, which
+    # overrides gsettings. Update the compositor's environment so newly opened
+    # applications see the wallpaper-specific theme too, and mirror it into
+    # the D-Bus/systemd activation environment for applications launched there.
+    gtk_environment = profile.get(
+        "gtk_environment",
+        f"{DEFAULT_GTK_THEME}:dark" if theme == f"{DEFAULT_GTK_THEME}-dark" else
+        theme + (":dark" if prefer_dark and not theme.endswith("-dark") else ""),
+    )
+    subprocess.run(
+        ["hyprctl", "keyword", "env", f"GTK_THEME,{gtk_environment}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
+    activation_env = os.environ.copy()
+    activation_env["GTK_THEME"] = gtk_environment
+    subprocess.run(
+        ["dbus-update-activation-environment", "--systemd", "GTK_THEME"],
+        env=activation_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    suffix = f" + {Path(supplement).name}" if supplement else ""
+    return f"GTK theme -> {theme}{suffix}\n"
+
+
+def current_wallpaper(items: list[Path]) -> int:
+    state = read_json(STATE)
+    raw = state.get("wallpaper") or (state.get("source") if state.get("kind") == "image" else "")
+    try:
+        current = Path(raw).expanduser().resolve()
+        return items.index(current)
+    except (ValueError, OSError, TypeError):
+        return 0
+
+
+def rgb(hex_color: str, alpha: float = 1.0) -> tuple[float, float, float, float]:
+    value = hex_color.removeprefix("#")
+    try:
+        return (*(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4)), alpha)
+    except (ValueError, IndexError):
+        return (1.0, 1.0, 1.0, alpha)
+
+
+class SelectorWindow(Gtk.ApplicationWindow):
+    def __init__(self, app: Gtk.Application, items: list[Path]):
+        super().__init__(application=app, title="Rice Wallpaper Selector")
+        self.items = items
+        self.index = current_wallpaper(items)
+        self.applying = False
+        self.error = ""
+        self.commit_timer = 0
+        self.pixbufs: dict[Path, GdkPixbuf.Pixbuf | None] = {}
+        self.colors = read_json(COLORS).get("colors", read_json(COLORS))
+
+        self.set_decorated(False)
+        self.set_default_size(1200, 680)
+        self.fullscreen()
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b"window { background: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.canvas = Gtk.DrawingArea()
+        self.canvas.set_draw_func(self.draw)
+        self.set_child(self.canvas)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.key_pressed)
+        keys.connect("key-released", self.key_released)
+        self.add_controller(keys)
+
+        click = Gtk.GestureClick()
+        click.connect("released", self.clicked)
+        self.add_controller(click)
+
+    def palette(self, name: str, fallback: str) -> str:
+        return self.colors.get(name, fallback)
+
+    def arm_timeout(self) -> None:
+        if self.commit_timer:
+            GLib.source_remove(self.commit_timer)
+        # Normally Super release commits. This only prevents a stranded overlay
+        # on compositors that do not forward the initiating modifier release.
+        self.commit_timer = GLib.timeout_add(4500, self.commit)
+
+    def cycle(self, direction: int) -> bool:
+        if self.applying or not self.items:
+            return GLib.SOURCE_REMOVE
+        self.index = (self.index + direction) % len(self.items)
+        self.canvas.queue_draw()
+        self.arm_timeout()
+        return GLib.SOURCE_REMOVE
+
+    def key_pressed(self, _controller, keyval, _keycode, state) -> bool:
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.commit()
+        elif keyval in (Gdk.KEY_Left, Gdk.KEY_h):
+            self.cycle(-1)
+        elif keyval in (Gdk.KEY_Right, Gdk.KEY_l):
+            self.cycle(1)
+        elif keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            backwards = keyval == Gdk.KEY_ISO_Left_Tab or bool(state & Gdk.ModifierType.SHIFT_MASK)
+            self.cycle(-1 if backwards else 1)
+        else:
+            return False
+        return True
+
+    def key_released(self, _controller, keyval, _keycode, _state) -> None:
+        if keyval in (Gdk.KEY_Super_L, Gdk.KEY_Super_R):
+            self.commit()
+
+    def clicked(self, _gesture, _presses, x, y) -> None:
+        width, height = self.get_width(), self.get_height()
+        card_w = min(570.0, width * 0.42)
+        card_h = card_w * 0.58
+        if abs(x - width / 2) < card_w / 2 and abs(y - height / 2) < card_h / 2:
+            self.commit()
+
+    def commit(self) -> bool:
+        if self.applying or not self.items:
+            return GLib.SOURCE_REMOVE
+        self.applying = True
+        if self.commit_timer:
+            GLib.source_remove(self.commit_timer)
+            self.commit_timer = 0
+        self.canvas.queue_draw()
+        selected = self.items[self.index]
+        threading.Thread(target=self._apply, args=(selected,), daemon=True).start()
+        return GLib.SOURCE_REMOVE
+
+    def _apply(self, selected: Path) -> None:
+        retheme = HOME / ".local/bin/retheme"
+        if not retheme.exists():
+            retheme = HOME / "rice/bin/retheme"
+        try:
+            result = subprocess.run(
+                retheme_command(retheme, selected), text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            if result.returncode:
+                LOG.write_text(result.stdout)
+                GLib.idle_add(self.apply_failed, f"retheme exited {result.returncode}")
+            else:
+                gtk_output = apply_wallpaper_gtk(selected)
+                LOG.write_text(result.stdout + gtk_output)
+                GLib.idle_add(self.close)
+        except OSError as exc:
+            GLib.idle_add(self.apply_failed, str(exc))
+
+    def apply_failed(self, message: str) -> bool:
+        self.applying = False
+        self.error = message
+        self.canvas.queue_draw()
+        GLib.timeout_add(2600, self.close)
+        return GLib.SOURCE_REMOVE
+
+    def load_pixbuf(self, path: Path) -> GdkPixbuf.Pixbuf | None:
+        if path not in self.pixbufs:
+            try:
+                self.pixbufs[path] = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    str(path), 900, 600, True
+                )
+            except GLib.Error:
+                self.pixbufs[path] = None
+        return self.pixbufs[path]
+
+    @staticmethod
+    def polygon(cr: cairo.Context, x: float, y: float, w: float, h: float, slant: float) -> None:
+        cr.move_to(x + slant, y)
+        cr.line_to(x + w, y)
+        cr.line_to(x + w - slant, y + h)
+        cr.line_to(x, y + h)
+        cr.close_path()
+
+    def draw_image(self, cr: cairo.Context, path: Path, x: float, y: float,
+                   w: float, h: float, alpha: float) -> None:
+        pixbuf = self.load_pixbuf(path)
+        if pixbuf is None:
+            cr.set_source_rgba(*rgb(self.palette("surface_high", "#263238"), alpha))
+            cr.paint()
+            return
+        pw, ph = pixbuf.get_width(), pixbuf.get_height()
+        scale = max(w / pw, h / ph)
+        ox, oy = x + (w - pw * scale) / 2, y + (h - ph * scale) / 2
+        cr.save()
+        cr.translate(ox, oy)
+        cr.scale(scale, scale)
+        Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+        cr.paint_with_alpha(alpha)
+        cr.restore()
+
+    def draw_card(self, cr: cairo.Context, path: Path, delta: int,
+                  width: float, height: float) -> None:
+        selected = delta == 0
+        base_w = min(570.0, width * 0.42)
+        w = base_w if selected else base_w * 0.80
+        h = w * 0.58
+        step = base_w * 0.66
+        x = width / 2 - w / 2 + delta * step
+        y = height / 2 - h / 2 + (0 if selected else 15)
+        slant = w * 0.13
+        accent = self.palette("primary", "#8bd0f0")
+        outline = self.palette("outline", "#9aa5ad")
+
+        # Wide, translucent copies of the silhouette make the image appear to
+        # bleed beyond its hard crop without adding a conventional card frame.
+        for spread, opacity in ((28, 0.035), (14, 0.065), (7, 0.10)):
+            cr.save()
+            self.polygon(cr, x - spread, y - spread, w + spread * 2,
+                         h + spread * 2, slant)
+            cr.set_source_rgba(*rgb(accent, opacity if selected else opacity * 0.35))
+            cr.fill()
+            cr.restore()
+
+        cr.save()
+        self.polygon(cr, x, y, w, h, slant)
+        cr.clip()
+        self.draw_image(cr, path, x, y, w, h, 1.0 if selected else 0.48)
+        if not selected:
+            cr.set_source_rgba(*rgb(self.palette("surface", "#10161a"), 0.25))
+            cr.paint()
+        cr.restore()
+
+        cr.save()
+        self.polygon(cr, x, y, w, h, slant)
+        cr.set_source_rgba(*rgb(accent if selected else outline, 0.96 if selected else 0.28))
+        cr.set_line_width(3.0 if selected else 1.0)
+        cr.stroke()
+        cr.restore()
+
+    def draw(self, _area, cr: cairo.Context, width: int, height: int) -> None:
+        surface = self.palette("surface", "#10161a")
+        cr.set_source_rgba(*rgb(surface, 0.72))
+        cr.paint()
+
+        if not self.items:
+            return
+
+        # Draw the selected card last so its slanted edge stays crisp over its neighbors.
+        visible: list[tuple[int, int]] = []
+        for idx in range(len(self.items)):
+            raw = (idx - self.index) % len(self.items)
+            delta = raw if raw <= len(self.items) / 2 else raw - len(self.items)
+            if abs(delta) <= 2:
+                visible.append((int(delta), idx))
+        for delta, idx in sorted(visible, key=lambda pair: pair[0] == 0):
+            self.draw_card(cr, self.items[idx], delta, width, height)
+
+
+class WallpaperSelector(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.jinho.RiceWallpaper")
+        self.window: SelectorWindow | None = None
+
+    def do_activate(self) -> None:
+        if self.window is None:
+            items = wallpapers()
+            self.window = SelectorWindow(self, items)
+            self.window.connect("close-request", self.window_closed)
+            self.window.present()
+            # The invoking Super+Shift+Tab is the first Alt-Tab-style step.
+            self.window.cycle(1)
+        else:
+            self.window.present()
+            self.window.cycle(1)
+
+    def window_closed(self, *_args) -> bool:
+        self.window = None
+        return False
+
+
+if __name__ == "__main__":
+    raise SystemExit(WallpaperSelector().run(sys.argv))

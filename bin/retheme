@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HOME = Path.home()
@@ -32,6 +33,7 @@ MATUGEN = shutil.which("matugen") or str(HOME / ".local/bin/matugen")
 STATE = HOME / ".local/share/rice"
 STATE_FILE = STATE / "state.json"
 COLORS_JSON = STATE / "colors.json"
+WALLPAPER_THEMES = STATE / "wallpaper-themes.json"
 STARSHIP = HOME / ".config/starship.toml"
 KITTY_CONF = HOME / ".config/kitty/kitty.conf"
 
@@ -47,6 +49,7 @@ SHELL_THEME = "Rice"
 # The root-window theme uses nearly square workstation windows. A tiny radius
 # avoids broken antialiasing at the corners without reading as a rounded card.
 ROUNDED_RADIUS = 2          # fallback when no theme profile is active
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
 
 
 def rounded_radius():
@@ -64,6 +67,38 @@ def rounded_radius():
         return int(r) if r is not None else ROUNDED_RADIUS
     except (OSError, ValueError, json.JSONDecodeError):
         return ROUNDED_RADIUS
+
+
+def matugen_image_path(path: Path) -> tuple[Path, Path | None]:
+    """Give extension-dependent Matugen a typed symlink for unnamed images."""
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        return path, None
+    try:
+        with path.open("rb") as source:
+            header = source.read(16)
+    except OSError:
+        return path, None
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        suffix = ".png"
+    elif header.startswith(b"\xff\xd8\xff"):
+        suffix = ".jpg"
+    elif header.startswith((b"GIF87a", b"GIF89a")):
+        suffix = ".gif"
+    elif header.startswith(b"BM"):
+        suffix = ".bmp"
+    elif header.startswith((b"II*\x00", b"MM\x00*")):
+        suffix = ".tiff"
+    elif header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        suffix = ".webp"
+    elif header[4:8] == b"ftyp" and header[8:12] in (b"avif", b"avis"):
+        suffix = ".avif"
+    else:
+        return path, None
+
+    temporary = Path(tempfile.mkdtemp(prefix="rice-matugen-"))
+    link = temporary / f"wallpaper{suffix}"
+    link.symlink_to(path.resolve())
+    return link, temporary
 
 # libadwaita's named accents. GNOME only accepts these enum values, so we snap
 # the generated primary to whichever one is perceptually closest.
@@ -194,6 +229,78 @@ def paper_palette(data, amount):
     return data
 
 
+TEXT_SURFACES = (
+    "background", "surface", "surface_bright", "surface_dim",
+    "surface_variant", "surface_container", "surface_container_low",
+    "surface_container_lowest", "surface_container_high",
+    "surface_container_highest",
+)
+
+
+def relative_luminance(hex_color):
+    """WCAG 2.2 relative luminance for an sRGB hex color."""
+    channels = []
+    for channel in hex_to_rgb(hex_color):
+        value = channel / 255.0
+        channels.append(value / 12.92 if value <= 0.04045 else
+                        ((value + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def contrast_ratio(first, second):
+    lighter, darker = sorted(
+        (relative_luminance(first), relative_luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def accessible_text_color(hex_color, backgrounds, target, mode):
+    """Move only L* until text clears `target` against every surface.
+
+    Retaining the original a/b coordinates keeps the wallpaper-derived hue.
+    Dark themes move toward white; light themes move toward black. Existing
+    colors that already pass are returned byte-for-byte unchanged.
+    """
+    if min(contrast_ratio(hex_color, bg) for bg in backgrounds) >= target:
+        return hex_color
+
+    lightness, a, b = rgb_to_lab(hex_to_rgb(hex_color))
+    endpoint = 100.0 if mode == "dark" else 0.0
+    for step in range(1, 1001):
+        amount = step / 1000.0
+        candidate_l = lightness + (endpoint - lightness) * amount
+        candidate = rgb_to_hex(lab_to_rgb((candidate_l, a, b)))
+        if min(contrast_ratio(candidate, bg) for bg in backgrounds) >= target:
+            return candidate
+    return "#ffffff" if mode == "dark" else "#000000"
+
+
+def add_accessible_text_roles(data, mode):
+    """Guarantee readable, palette-matched text for every generated theme.
+
+    Primary text targets WCAG AAA (7:1). Secondary and muted text target AA
+    (4.5:1). The muted role starts from Material's outline hue, but is kept
+    separate because `outline` is also a border token and only needs 3:1.
+    """
+    colors = data["colors"]
+    backgrounds = [
+        colors[key][mode]["color"] for key in TEXT_SURFACES
+        if key in colors and mode in colors[key]
+    ]
+    for role, target in (("on_surface", 7.0),
+                         ("on_surface_variant", 4.5)):
+        safe = accessible_text_color(
+            colors[role][mode]["color"], backgrounds, target, mode)
+        colors[role][mode]["color"] = safe
+        colors[role]["default"]["color"] = safe
+
+    muted = accessible_text_color(
+        colors["outline"][mode]["color"], backgrounds, 4.5, mode)
+    colors["rice_text_muted"] = {
+        variant: {"color": muted} for variant in ("dark", "light", "default")
+    }
+    return data
+
+
 # Material You has no green/yellow slot, so mapping starship's color_green onto
 # `tertiary` yields whatever hue the wallpaper happened to produce (often pink).
 # Instead we synthesize semantic colors at fixed hues, borrowing lightness and
@@ -247,6 +354,35 @@ def backup_once(path: Path):
         print(f"  backed up {path.name} -> {bak.name}")
 
 
+def remember_wallpaper(path: str, colors: dict, args) -> None:
+    """Pin the generated seed to this image so returning restores its look.
+
+    Image color extraction is intentionally heuristic. Persisting its result
+    also lets a manually seeded wallpaper keep that deliberate choice instead
+    of being re-extracted differently when the selector comes back to it.
+    """
+    if not path:
+        return
+    try:
+        profiles = json.loads(WALLPAPER_THEMES.read_text()) if WALLPAPER_THEMES.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        profiles = {}
+    key = str(Path(path).expanduser().resolve())
+    # Keep user-authored extras such as a wallpaper's GTK theme association.
+    # Palette extraction owns only the fields below; replacing the whole entry
+    # would silently discard the GTK mapping every time this wallpaper returns.
+    profile = profiles.get(key, {})
+    profile.update({
+        "seed": colors["source"],
+        "scheme": args.scheme,
+        "mode": args.mode,
+        "tint": args.tint,
+        "paper": args.paper,
+    })
+    profiles[key] = profile
+    WALLPAPER_THEMES.write_text(json.dumps(profiles, indent=2) + "\n")
+
+
 def ensure_kitty_include():
     """Point kitty.conf at the generated theme instead of the static one."""
     if not KITTY_CONF.exists():
@@ -270,7 +406,7 @@ def patch_starship(colors):
     mapping = {
         "color_ink": colors["on_surface"],
         "color_accent": colors["primary"],
-        "color_muted": colors["outline"],
+        "color_muted": colors.get("text_muted", colors["on_surface_variant"]),
         "color_red": colors.get("red", colors["error"]),
         "color_green": colors.get("green", colors["tertiary"]),
     }
@@ -400,6 +536,10 @@ def reload_apps():
             sh(["kitty", "@", "--to", f"unix:{sock}", "load-config"])
     print("  reloaded live kitty instances")
     reload_shell_theme()
+    hypr_reload = HOME / "rice/bin/hypr-reload"
+    if hypr_reload.exists():
+        sh([str(hypr_reload)])
+        print("  hyprland rice refreshed")
 
 
 def main():
@@ -443,6 +583,7 @@ def main():
         args.image = src if state.get("kind") == "image" else None
         args.seed = None if args.image else src
         args.scheme = state.get("scheme", args.scheme)
+        args.mode = state.get("mode", args.mode)
         args.tint = state.get("tint", args.tint)
         args.paper = state.get("paper", args.paper)
 
@@ -462,7 +603,8 @@ def main():
         img = Path(args.image).expanduser()
         if not img.exists():
             sys.exit(f"no such image: {img}")
-        cmd = base + ["image", str(img), "--prefer", args.prefer]
+        extraction_image, temporary = matugen_image_path(img)
+        cmd = base + ["image", str(extraction_image), "--prefer", args.prefer]
         kind, source = "image", str(img)
 
     print(f"palette from {kind}: {source}  [scheme-{args.scheme}, {args.mode}, "
@@ -470,6 +612,9 @@ def main():
 
     # Stage 1: extract the raw scheme as JSON without rendering anything.
     res = sh(cmd + ["--json", "hex", "-q"])
+    if not args.seed and temporary is not None:
+        (temporary / extraction_image.name).unlink(missing_ok=True)
+        temporary.rmdir()
     if res.returncode != 0:
         sys.exit(f"matugen failed:\n{res.stderr}")
     raw = json.loads(res.stdout)
@@ -479,6 +624,7 @@ def main():
     tinted = tint_palette(raw, src_hex, args.tint)
     if args.mode == "light":
         tinted = paper_palette(tinted, args.paper)
+    tinted = add_accessible_text_roles(tinted, args.mode)
     tinted = add_semantic_colors(tinted, args.mode)
     tinted_path = STATE / "palette-tinted.json"
     tinted_path.write_text(json.dumps(tinted))
@@ -495,6 +641,21 @@ def main():
 
     print(f"  templates written (primary {colors['primary']}, "
           f"surface {colors['surface']})")
+    wallpaper = state.get("wallpaper", "")
+    if args.wallpaper:
+        wallpaper = str(Path(args.wallpaper).expanduser().resolve())
+    elif kind == "image" and not args.no_wallpaper:
+        wallpaper = str(Path(source).expanduser().resolve())
+
+    # Hyprland's reload bridge reads this file to choose its swaybg image, so
+    # publish the new palette and wallpaper atomically before asking it to run.
+    STATE_FILE.write_text(json.dumps(
+        {"kind": kind, "source": source, "wallpaper": wallpaper,
+         "scheme": args.scheme, "mode": args.mode, "tint": args.tint,
+         "paper": args.paper, "colors": colors}, indent=2))
+    if not args.no_wallpaper:
+        remember_wallpaper(wallpaper, colors, args)
+
     set_accent(colors)
     set_window_border(colors)
     patch_starship(colors)
@@ -505,10 +666,6 @@ def main():
             set_wallpaper(Path(source))
     reload_apps()
 
-    STATE_FILE.write_text(json.dumps(
-        {"kind": kind, "source": source, "scheme": args.scheme,
-         "mode": args.mode, "tint": args.tint, "paper": args.paper,
-         "colors": colors}, indent=2))
     print("done. GTK apps pick up the new palette as they restart.")
 
 
