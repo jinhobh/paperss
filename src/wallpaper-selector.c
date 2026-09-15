@@ -12,7 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define APP_ID "io.github.jinho.RiceWallpaper"
+#define APP_ID "io.github.jinho.PaperssWallpaper"
 #define THUMBNAIL_WIDTH 900
 #define THUMBNAIL_HEIGHT 600
 #define THUMBNAIL_RADIUS 2
@@ -600,12 +600,22 @@ static gboolean hide_selector(gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
+static void commit(Selector *selector);
+
+static gboolean commit_timer_expired(gpointer user_data)
+{
+    Selector *selector = user_data;
+    selector->commit_timer = 0;
+    commit(selector);
+    return G_SOURCE_REMOVE;
+}
+
 static void arm_commit_timer(Selector *selector)
 {
     if (selector->commit_timer != 0) {
         g_source_remove(selector->commit_timer);
     }
-    selector->commit_timer = g_timeout_add(4500, hide_selector, selector);
+    selector->commit_timer = g_timeout_add(4500, commit_timer_expired, selector);
 }
 
 static void cycle(Selector *selector, gint direction)
