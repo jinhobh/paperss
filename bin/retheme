@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
-"""retheme — drive the whole desktop palette from one wallpaper or seed color.
+"""retheme — derive and apply a desktop palette from one wallpaper or seed.
 
     retheme <image>              # palette from an image, and set it as wallpaper
-    retheme --seed '#040480'     # palette from a color, wallpaper untouched
-    retheme --relight            # re-apply the current palette (after config edits)
+    retheme --seed '#040480'     # palette from a hex color instead of an image
+    retheme --relight            # re-apply the current palette
     retheme --scheme vibrant     # matugen scheme variant (default: tonal-spot)
     retheme <image> --tint 0.6   # push surfaces toward the source hue
 
-Targets are declared in ~/.config/matugen/config.toml. This script adds the
-things matugen can't template: the GNOME wallpaper, the named shell accent,
-starship's inline palette block, and reload signals.
-
-It also adds a tint stage. Material You always renders dark-mode surfaces as
-near-black regardless of the seed, which flattens a strongly-hued identity
-(a Klein-blue wallpaper produces a #131318 desktop). `--tint` rotates the
-surface family toward the source hue *at constant lightness*, so the field
-carries the color while every M3 contrast pairing still holds.
+Matugen renders the GTK and Kitty files. `hypr-reload` renders the Hyprland,
+Waybar, Wofi, Mako, Firefox, and Spotify integrations and restarts `swaybg`.
+The Python stages add the semantic colors and contrast adjustments that are
+specific to this wallpaper switcher.
 """
 import argparse
 import json
 import math
-import os
-import re
 import shutil
 import subprocess
 import sys
@@ -34,39 +27,8 @@ STATE = HOME / ".local/share/rice"
 STATE_FILE = STATE / "state.json"
 COLORS_JSON = STATE / "colors.json"
 WALLPAPER_THEMES = STATE / "wallpaper-themes.json"
-STARSHIP = HOME / ".config/starship.toml"
 KITTY_CONF = HOME / ".config/kitty/kitty.conf"
-
-# Extensions ship their schemas inside their own directory rather than in the
-# system schema path, so gsettings needs --schemadir to see them.
-EXT = HOME / ".local/share/gnome-shell/extensions"
-TILINGSHELL_SCHEMAS = EXT / "tilingshell@ferrarodomenico.com/schemas"
-RWC_SCHEMAS = EXT / "rounded-window-corners@fxgn/schemas"
-USER_THEME_SCHEMAS = EXT / "user-theme@gnome-shell-extensions.gcampax.github.com/schemas"
-
-SHELL_THEME = "Rice"
-
-# The root-window theme uses nearly square workstation windows. A tiny radius
-# avoids broken antialiasing at the corners without reading as a rounded card.
-ROUNDED_RADIUS = 2          # fallback when no theme profile is active
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
-
-
-def rounded_radius():
-    """The corner radius the active theme asks for.
-
-    A theme owns its corner radius, but `retheme` is also run directly and by
-    `poster --apply` every hour — and it rewrites the whole packed corner dict
-    each time. Without reading the profile here, an hourly run would quietly
-    put the klein theme's 2px radius back on a square System 7 desktop.
-    """
-    try:
-        name = (STATE / "current-theme").read_text().strip()
-        manifest = STATE / "themes" / name / "theme.json"
-        r = json.loads(manifest.read_text()).get("chrome", {}).get("corner_radius")
-        return int(r) if r is not None else ROUNDED_RADIUS
-    except (OSError, ValueError, json.JSONDecodeError):
-        return ROUNDED_RADIUS
 
 
 def matugen_image_path(path: Path) -> tuple[Path, Path | None]:
@@ -99,16 +61,6 @@ def matugen_image_path(path: Path) -> tuple[Path, Path | None]:
     link = temporary / f"wallpaper{suffix}"
     link.symlink_to(path.resolve())
     return link, temporary
-
-# libadwaita's named accents. GNOME only accepts these enum values, so we snap
-# the generated primary to whichever one is perceptually closest.
-NAMED_ACCENTS = {
-    "blue": "#3584e4", "teal": "#2190a4", "green": "#3a944a",
-    "yellow": "#c88800", "orange": "#ed5b00", "red": "#e62d42",
-    "pink": "#d56199", "purple": "#9141ac", "slate": "#6f8396",
-    "brown": "#986a44",
-}
-
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
@@ -329,26 +281,8 @@ def add_semantic_colors(data, mode):
     return data
 
 
-def nearest_accent(hex_color):
-    """Snap to the closest named accent, weighting hue over lightness.
-
-    Generated primaries are pastel (high L), named accents are saturated, so
-    plain deltaE would collapse everything onto 'slate'. Discounting the L
-    axis keeps the comparison about hue and chroma, which is what reads as
-    'the accent color' on screen.
-    """
-    L1, a1, b1 = rgb_to_lab(hex_to_rgb(hex_color))
-    best, best_d = "blue", float("inf")
-    for name, hx in NAMED_ACCENTS.items():
-        L2, a2, b2 = rgb_to_lab(hex_to_rgb(hx))
-        d = math.sqrt(0.25 * (L1 - L2) ** 2 + (a1 - a2) ** 2 + (b1 - b2) ** 2)
-        if d < best_d:
-            best, best_d = name, d
-    return best
-
-
 def backup_once(path: Path):
-    bak = path.with_suffix(path.suffix + ".pre-rice")
+    bak = path.with_suffix(path.suffix + ".pre-paperss")
     if path.exists() and not bak.exists():
         shutil.copy2(path, bak)
         print(f"  backed up {path.name} -> {bak.name}")
@@ -368,9 +302,8 @@ def remember_wallpaper(path: str, colors: dict, args) -> None:
     except (OSError, json.JSONDecodeError):
         profiles = {}
     key = str(Path(path).expanduser().resolve())
-    # Keep user-authored extras such as a wallpaper's GTK theme association.
-    # Palette extraction owns only the fields below; replacing the whole entry
-    # would silently discard the GTK mapping every time this wallpaper returns.
+    # Palette extraction owns only the fields below; preserve any future
+    # user-authored metadata on the profile when the seed is refreshed.
     profile = profiles.get(key, {})
     profile.update({
         "seed": colors["source"],
@@ -394,152 +327,22 @@ def ensure_kitty_include():
         backup_once(KITTY_CONF)
         KITTY_CONF.write_text(
             text.replace("include hermes-theme.conf", "include matugen-theme.conf"))
-        print("  kitty.conf now includes matugen-theme.conf "
-              "(hermes-theme.conf kept as a preset)")
-
-
-def patch_starship(colors):
-    """Rewrite the values inside starship's [palettes.*] block, nothing else."""
-    if not STARSHIP.exists():
-        return
-    text = STARSHIP.read_text()
-    mapping = {
-        "color_ink": colors["on_surface"],
-        "color_accent": colors["primary"],
-        "color_muted": colors.get("text_muted", colors["on_surface_variant"]),
-        "color_red": colors.get("red", colors["error"]),
-        "color_green": colors.get("green", colors["tertiary"]),
-    }
-    m = re.search(r"^\[palettes\.[\w-]+\]\s*$", text, re.M)
-    if not m:
-        return
-    start = m.end()
-    nxt = re.search(r"^\[", text[start:], re.M)
-    end = start + (nxt.start() if nxt else len(text) - start)
-    block, changed = text[start:end], False
-    for key, val in mapping.items():
-        block, n = re.subn(rf"^({key}\s*=\s*)'[^']*'", rf"\g<1>'{val}'",
-                           block, flags=re.M)
-        changed = changed or bool(n)
-    if changed:
-        backup_once(STARSHIP)
-        STARSHIP.write_text(text[:start] + block + text[end:])
-        print("  starship palette updated")
-
-
-def set_wallpaper(path: Path):
-    uri = path.resolve().as_uri()
-    for key in ("picture-uri", "picture-uri-dark"):
-        sh(["gsettings", "set", "org.gnome.desktop.background", key, uri])
-    sh(["gsettings", "set", "org.gnome.desktop.background", "picture-options", "zoom"])
-    print(f"  wallpaper -> {path.name}")
-
-
-def set_accent(colors):
-    # Snap from source_color, not primary: M3 primaries are pale pastels whose
-    # chroma is too low to match any named accent, so they all collapse onto
-    # 'slate'. The source color is the one that actually carries the hue.
-    basis = colors.get("source") or colors["primary"]
-    accent = nearest_accent(basis)
-    sh(["gsettings", "set", "org.gnome.desktop.interface", "accent-color", accent])
-    print(f"  shell accent -> {accent} (from {basis})")
-
-
-def ext_set(schemadir: Path, schema: str, key: str, value: str):
-    if not schemadir.exists():
-        return False
-    res = sh(["gsettings", "--schemadir", str(schemadir), "set", schema, key, value])
-    return res.returncode == 0
-
-
-def set_window_border(colors):
-    """Border and round every window, from whichever extension is available.
-
-    Rounded Window Corners Reborn is preferred and owns *both* the corner clip
-    and the border, because it draws the border along its own clip path — they
-    are guaranteed to agree. Tiling Shell's border only traces the window's
-    native radius, which for kitty means square bottom corners no matter what
-    the clipper does, so the two must not both be on.
-    """
-    if RWC_SCHEMAS.exists():
-        set_rounded_corners(colors)
-        # Hand the border over; two borders on one window read as a double line.
-        ext_set(TILINGSHELL_SCHEMAS, "org.gnome.shell.extensions.tilingshell",
-                "enable-window-border", "false")
-        return
-
-    if not TILINGSHELL_SCHEMAS.exists():
-        print("  window border -> skipped (no border extension installed)")
-        return
-    schema = "org.gnome.shell.extensions.tilingshell"
-    for key, value in (
-        ("enable-window-border", "true"),
-        ("window-use-custom-border-color", "true"),
-        ("window-border-color", f"'{colors['outline']}'"),
-        ("window-border-width", "1"),
-        ("inner-gaps", "8"),
-        ("outer-gaps", "6"),
-    ):
-        ext_set(TILINGSHELL_SCHEMAS, schema, key, value)
-    print(f"  window border -> {colors['primary']} (2px)")
-
-
-def set_rounded_corners(colors):
-    # kitty draws its own decorations and exposes no radius option, so the only
-    # way to round it is a compositor-level clip. This extension shapes every
-    # window regardless of toolkit, and `tweak-kitty-terminal` handles kitty's
-    # non-standard surface specifically.
-    schema = "org.gnome.shell.extensions.rounded-window-corners-reborn"
-    r, g, b = hex_to_rgb(colors["outline"])
-    border = f"[{r / 255:.4f}, {g / 255:.4f}, {b / 255:.4f}, 1.0]"
-
-    # One packed a{sv}; gsettings has no way to update a single member, so the
-    # whole dict is rewritten. Maximized and fullscreen keep square corners —
-    # they sit flush to the screen edge.
-    radius = rounded_radius()
-    settings = (
-        "{'padding': <{'left': <uint32 1>, 'right': <uint32 1>, "
-        "'top': <uint32 1>, 'bottom': <uint32 1>}>, "
-        "'keepRoundedCorners': <{'maximized': <false>, 'fullscreen': <false>}>, "
-        f"'borderRadius': <uint32 {radius}>, 'smoothing': <0>, "
-        f"'borderColor': <{border}>, 'enabled': <true>}}"
-    )
-    ext_set(RWC_SCHEMAS, schema, "global-rounded-corner-settings", settings)
-    ext_set(RWC_SCHEMAS, schema, "border-width", "1")
-    ext_set(RWC_SCHEMAS, schema, "tweak-kitty-terminal", "true")
-    # libadwaita apps round themselves, but skipping them means they alone would
-    # miss the border — so include them and let one extension style everything.
-    ext_set(RWC_SCHEMAS, schema, "skip-libadwaita-app", "false")
-    print(f"  window border -> {colors['outline']} (1px, {radius}px radius)")
-
-
-def reload_shell_theme():
-    # GNOME Shell only re-reads its stylesheet when the theme *name* changes,
-    # and on Wayland the shell can't be restarted. Blanking the name and
-    # setting it back forces a reparse of the regenerated CSS in place.
-    theme_dir = HOME / ".themes" / SHELL_THEME / "gnome-shell"
-    if not (theme_dir / "gnome-shell.css").exists():
-        print(f"  shell theme -> skipped (no {SHELL_THEME} theme yet)")
-        return
-    schema = "org.gnome.shell.extensions.user-theme"
-    if not ext_set(USER_THEME_SCHEMAS, schema, "name", "''"):
-        print("  shell theme -> skipped (user-theme extension unavailable)")
-        return
-    ext_set(USER_THEME_SCHEMAS, schema, "name", f"'{SHELL_THEME}'")
-    print(f"  shell theme -> {SHELL_THEME} (reloaded)")
+        print("  kitty.conf now includes matugen-theme.conf")
 
 
 def reload_apps():
-    # kitty reload is a matugen post_hook; nudge any other live sockets too.
+    """Refresh live clients and hand the wallpaper to the Hyprland bridge."""
     for sock in Path("/tmp").glob("kitty*"):
         if sock.is_socket():
             sh(["kitty", "@", "--to", f"unix:{sock}", "load-config"])
     print("  reloaded live kitty instances")
-    reload_shell_theme()
-    hypr_reload = HOME / "rice/bin/hypr-reload"
-    if hypr_reload.exists():
-        sh([str(hypr_reload)])
-        print("  hyprland rice refreshed")
+
+    helper = HOME / ".local/bin/hypr-reload"
+    if not helper.exists():
+        helper = Path(__file__).with_name("hypr-reload")
+    if helper.exists():
+        sh([str(helper)])
+        print("  desktop clients and swaybg refreshed")
 
 
 def main():
@@ -559,8 +362,7 @@ def main():
                     help="generate the palette but leave the desktop background alone")
     ap.add_argument("--wallpaper", metavar="PATH",
                     help="set this image as the background while taking the palette "
-                         "from --seed (used by `poster`, which already knows its "
-                         "own seed and shouldn't have it re-guessed from pixels)")
+                         "from --seed instead of re-extracting its pixels")
     ap.add_argument("--tint", type=float, default=0.45, metavar="0..1",
                     help="how far to pull surfaces toward the source hue "
                          "(0 = stock Material You near-black, 1 = full hue). "
@@ -656,14 +458,6 @@ def main():
     if not args.no_wallpaper:
         remember_wallpaper(wallpaper, colors, args)
 
-    set_accent(colors)
-    set_window_border(colors)
-    patch_starship(colors)
-    if not args.no_wallpaper:
-        if args.wallpaper:
-            set_wallpaper(Path(args.wallpaper).expanduser())
-        elif kind == "image":
-            set_wallpaper(Path(source))
     reload_apps()
 
     print("done. GTK apps pick up the new palette as they restart.")

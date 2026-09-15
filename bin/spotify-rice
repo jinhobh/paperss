@@ -1,3 +1,0 @@
-#!/bin/sh
-# Run the user-owned Spotify copy that Spicetify patches with the Rice theme.
-exec "$HOME/.local/opt/spotify-rice/spotify" "$@"
