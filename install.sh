@@ -103,6 +103,8 @@ Optional integrations:
 Add this binding to ~/.config/hypr/hyprland.conf if it is not already present:
 
   bind = $mainMod SHIFT, Tab, exec, wallpaper-selector
+  bindr = , SUPER_L, exec, wallpaper-selector --commit
+  bindr = , SUPER_R, exec, wallpaper-selector --commit
 
 Then reload Hyprland. Super+Shift+Tab opens the selector; release Super or
 press Enter to apply the selected wallpaper and palette.

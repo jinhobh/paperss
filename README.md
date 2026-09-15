@@ -42,7 +42,13 @@ The selector is normally launched by this Hyprland binding:
 
 ```ini
 bind = $mainMod SHIFT, Tab, exec, wallpaper-selector
+bindr = , SUPER_L, exec, wallpaper-selector --commit
+bindr = , SUPER_R, exec, wallpaper-selector --commit
 ```
+
+The `bindr` lines provide a compositor-level Super-release signal. They are
+important on setups where Wayland does not forward the global modifier release
+to the selector window.
 
 Set `RICE_WALLPAPER_DIR` to use a different wallpaper directory. Otherwise the
 selector reads `~/Pictures/Wallpapers`.

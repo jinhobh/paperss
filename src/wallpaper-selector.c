@@ -985,6 +985,9 @@ static void activate(GtkApplication *application, gpointer user_data)
     AppState *app = user_data;
     UNUSED(application);
     if (app->selector == NULL) {
+        /* Hold only after this process is the primary application. Remote
+         * command-line launchers must be allowed to exit after forwarding. */
+        g_application_hold(G_APPLICATION(application));
         app->selector = selector_new(app);
         gtk_window_present(GTK_WINDOW(app->selector->window));
         cycle(app->selector, 1);
@@ -995,13 +998,42 @@ static void activate(GtkApplication *application, gpointer user_data)
     cycle(app->selector, 1);
 }
 
+static int command_line(GtkApplication *application,
+                        GApplicationCommandLine *command_line,
+                        gpointer user_data)
+{
+    AppState *app = user_data;
+    int argc = 0;
+    gchar **argv = g_application_command_line_get_arguments(command_line, &argc);
+    gboolean commit_requested = FALSE;
+
+    for (int i = 1; i < argc; i++) {
+        if (g_strcmp0(argv[i], "--commit") == 0) {
+            commit_requested = TRUE;
+            break;
+        }
+    }
+
+    if (commit_requested) {
+        /* A release arriving before the primary is registered is harmless. */
+        if (app->selector != NULL) {
+            commit(app->selector);
+        }
+    } else {
+        activate(application, app);
+    }
+
+    g_strfreev(argv);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     AppState app = {0};
-    app.application = GTK_APPLICATION(
-        gtk_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS));
+    app.application = GTK_APPLICATION(gtk_application_new(
+        APP_ID, G_APPLICATION_DEFAULT_FLAGS | G_APPLICATION_HANDLES_COMMAND_LINE));
     g_signal_connect(app.application, "activate", G_CALLBACK(activate), &app);
-    g_application_hold(G_APPLICATION(app.application));
+    g_signal_connect(app.application, "command-line", G_CALLBACK(command_line), &app);
 
     int status = g_application_run(G_APPLICATION(app.application), argc, argv);
     selector_free(app.selector);
