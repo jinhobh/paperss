@@ -7,11 +7,13 @@ Super, press Enter, or click the selected card to apply it; Escape cancels.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cairo
@@ -33,6 +35,10 @@ GTK3_SETTINGS = HOME / ".config/gtk-3.0/settings.ini"
 GTK4_SETTINGS = HOME / ".config/gtk-4.0/settings.ini"
 GTK3_CSS = HOME / ".config/gtk-3.0/gtk.css"
 DEFAULT_GTK_THEME = "Adwaita"
+THUMBNAIL_WIDTH = 900
+THUMBNAIL_HEIGHT = 600
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+THUMBNAIL_CACHE = CACHE_HOME / "rice/wallpaper-thumbnails"
 
 
 def read_json(path: Path) -> dict:
@@ -72,6 +78,63 @@ def wallpapers() -> list[Path]:
             return []
 
     return images(user_dir)
+
+
+def thumbnail_cache_path(path: Path) -> Path | None:
+    """Return a cache path tied to the source file's current contents."""
+    try:
+        stat = path.stat()
+        identity = (
+            f"{path.resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}\0"
+            f"{THUMBNAIL_WIDTH}x{THUMBNAIL_HEIGHT}"
+        )
+    except OSError:
+        return None
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    return THUMBNAIL_CACHE / f"{key}.png"
+
+
+def load_thumbnail(path: Path) -> GdkPixbuf.Pixbuf | None:
+    """Decode a cached thumbnail, creating it from the source when needed.
+
+    This function is deliberately called by a worker, never by the GTK draw
+    callback. The cache turns repeated selector launches into small-image
+    loads while keeping the first launch responsive too.
+    """
+    cache = thumbnail_cache_path(path)
+    if cache is not None and cache.is_file():
+        try:
+            return GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                str(cache), THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, True
+            )
+        except GLib.Error:
+            try:
+                cache.unlink()
+            except OSError:
+                pass
+
+    try:
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+            str(path), THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT, True
+        )
+    except GLib.Error:
+        return None
+
+    if cache is not None:
+        temporary = cache.with_name(
+            f".{cache.name}.{os.getpid()}-{threading.get_ident()}.tmp"
+        )
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            pixbuf.savev(str(temporary), "png", [], [])
+            os.replace(temporary, cache)
+        except (GLib.Error, OSError):
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    return pixbuf
 
 
 def retheme_command(retheme: Path, selected: Path) -> list[str]:
@@ -202,7 +265,12 @@ class SelectorWindow(Gtk.ApplicationWindow):
         self.applying = False
         self.error = ""
         self.commit_timer = 0
-        self.pixbufs: dict[Path, GdkPixbuf.Pixbuf | None] = {}
+        self.pixbufs: dict[Path, GdkPixbuf.Pixbuf] = {}
+        self.loading: set[Path] = set()
+        self.failed: set[Path] = set()
+        self.thumbnail_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="rice-wallpaper"
+        )
         self.colors = read_json(COLORS).get("colors", read_json(COLORS))
 
         self.set_decorated(False)
@@ -227,6 +295,7 @@ class SelectorWindow(Gtk.ApplicationWindow):
         click = Gtk.GestureClick()
         click.connect("released", self.clicked)
         self.add_controller(click)
+        self.preload_nearby()
 
     def palette(self, name: str, fallback: str) -> str:
         return self.colors.get(name, fallback)
@@ -242,9 +311,53 @@ class SelectorWindow(Gtk.ApplicationWindow):
         if self.applying or not self.items:
             return GLib.SOURCE_REMOVE
         self.index = (self.index + direction) % len(self.items)
+        self.preload_nearby()
         self.canvas.queue_draw()
         self.arm_timeout()
         return GLib.SOURCE_REMOVE
+
+    def nearby_paths(self, radius: int = 2) -> list[Path]:
+        """Return the cards likely to become visible next."""
+        if not self.items:
+            return []
+        return [
+            self.items[(self.index + offset) % len(self.items)]
+            for offset in range(-radius, radius + 1)
+        ]
+
+    def preload_nearby(self) -> None:
+        for path in self.nearby_paths():
+            self.request_pixbuf(path)
+
+    def request_pixbuf(self, path: Path) -> None:
+        if path in self.pixbufs or path in self.loading or path in self.failed:
+            return
+        self.loading.add(path)
+        future = self.thumbnail_pool.submit(load_thumbnail, path)
+        future.add_done_callback(
+            lambda completed, path=path: GLib.idle_add(
+                self.pixbuf_loaded, path, completed
+            )
+        )
+
+    def pixbuf_loaded(self, path: Path, future) -> bool:
+        self.loading.discard(path)
+        try:
+            pixbuf = future.result()
+        except Exception:
+            pixbuf = None
+        if pixbuf is None:
+            self.failed.add(path)
+        else:
+            self.pixbufs[path] = pixbuf
+        self.canvas.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    def load_pixbuf(self, path: Path) -> GdkPixbuf.Pixbuf | None:
+        """Return only already-loaded images; never block the draw callback."""
+        if path not in self.pixbufs:
+            self.request_pixbuf(path)
+        return self.pixbufs.get(path)
 
     def key_pressed(self, _controller, keyval, _keycode, state) -> bool:
         if keyval == Gdk.KEY_Escape:
@@ -311,15 +424,8 @@ class SelectorWindow(Gtk.ApplicationWindow):
         GLib.timeout_add(2600, self.close)
         return GLib.SOURCE_REMOVE
 
-    def load_pixbuf(self, path: Path) -> GdkPixbuf.Pixbuf | None:
-        if path not in self.pixbufs:
-            try:
-                self.pixbufs[path] = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    str(path), 900, 600, True
-                )
-            except GLib.Error:
-                self.pixbufs[path] = None
-        return self.pixbufs[path]
+    def dispose(self) -> None:
+        self.thumbnail_pool.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
     def polygon(cr: cairo.Context, x: float, y: float, w: float, h: float, slant: float) -> None:
@@ -407,6 +513,9 @@ class SelectorWindow(Gtk.ApplicationWindow):
 class WallpaperSelector(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="io.github.jinho.RiceWallpaper")
+        # Keep the application registered after the overlay closes so later
+        # Super+Shift+Tab presses reuse GTK instead of paying cold-start cost.
+        self.hold()
         self.window: SelectorWindow | None = None
 
     def do_activate(self) -> None:
@@ -422,6 +531,8 @@ class WallpaperSelector(Gtk.Application):
             self.window.cycle(1)
 
     def window_closed(self, *_args) -> bool:
+        if self.window is not None:
+            self.window.dispose()
         self.window = None
         return False
 
