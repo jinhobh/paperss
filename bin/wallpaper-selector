@@ -4,7 +4,7 @@
 # user-local build directory.
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
 BINARY=${PAPERSS_SELECTOR_BIN:-"$HOME/.local/libexec/paperss/wallpaper-selector"}
 
 if [ ! -x "$BINARY" ] && [ -x "$SCRIPT_DIR/../build/wallpaper-selector" ]; then
