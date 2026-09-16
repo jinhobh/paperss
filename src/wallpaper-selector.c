@@ -30,11 +30,13 @@ typedef struct _AppState AppState;
 typedef struct {
     Selector *selector;
     gchar *path;
+    guint generation;
 } ThumbnailRequest;
 
 typedef struct {
     Selector *selector;
     gchar *path;
+    guint generation;
     GdkPixbuf *pixbuf;
 } ThumbnailResult;
 
@@ -58,6 +60,11 @@ struct _Selector {
     gboolean applying;
     gchar *error;
     guint commit_timer;
+    gchar *wallpaper_directory;
+    GFileMonitor *wallpaper_monitor;
+    guint wallpaper_refresh_timer;
+    gboolean wallpaper_refresh_invalidates_thumbnails;
+    guint thumbnail_generation;
     GHashTable *pixbufs;
     GHashTable *loading;
     GHashTable *failed;
@@ -279,21 +286,41 @@ static GdkPixbuf *load_thumbnail(const gchar *path)
     return pixbuf;
 }
 
+static gboolean selector_contains_path(Selector *selector, const gchar *path)
+{
+    for (guint i = 0; i < selector->items->len; i++) {
+        if (g_strcmp0(path, g_ptr_array_index(selector->items, i)) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static gboolean thumbnail_loaded_on_main(gpointer user_data)
 {
     ThumbnailResult *result = user_data;
     Selector *selector = result->selector;
+    gpointer generation = GUINT_TO_POINTER(result->generation + 1);
 
-    g_hash_table_remove(selector->loading, result->path);
-    if (result->pixbuf != NULL) {
-        g_hash_table_replace(selector->pixbufs, g_strdup(result->path),
-                             result->pixbuf);
-        result->pixbuf = NULL;
-    } else {
-        g_hash_table_add(selector->failed, g_strdup(result->path));
+    /* A directory refresh may have replaced this path's request. Do not let
+     * an old worker remove the newer request from the loading set. */
+    if (g_hash_table_lookup(selector->loading, result->path) == generation) {
+        g_hash_table_remove(selector->loading, result->path);
     }
 
-    gtk_widget_queue_draw(GTK_WIDGET(selector->canvas));
+    if (result->generation == selector->thumbnail_generation &&
+        selector_contains_path(selector, result->path)) {
+        if (result->pixbuf != NULL) {
+            g_hash_table_replace(selector->pixbufs, g_strdup(result->path),
+                                 result->pixbuf);
+            result->pixbuf = NULL;
+        } else {
+            g_hash_table_add(selector->failed, g_strdup(result->path));
+        }
+
+        gtk_widget_queue_draw(GTK_WIDGET(selector->canvas));
+    }
+
     g_free(result->path);
     g_clear_object(&result->pixbuf);
     g_free(result);
@@ -307,6 +334,7 @@ static void thumbnail_worker(gpointer user_data, gpointer pool_data)
     ThumbnailResult *result = g_new0(ThumbnailResult, 1);
     result->selector = request->selector;
     result->path = g_strdup(request->path);
+    result->generation = request->generation;
     result->pixbuf = load_thumbnail(request->path);
     g_main_context_invoke(NULL, thumbnail_loaded_on_main, result);
     g_free(request->path);
@@ -321,10 +349,12 @@ static void request_thumbnail(Selector *selector, const gchar *path)
         return;
     }
 
-    g_hash_table_add(selector->loading, g_strdup(path));
+    g_hash_table_insert(selector->loading, g_strdup(path),
+                        GUINT_TO_POINTER(selector->thumbnail_generation + 1));
     ThumbnailRequest *request = g_new0(ThumbnailRequest, 1);
     request->selector = selector;
     request->path = g_strdup(path);
+    request->generation = selector->thumbnail_generation;
     g_thread_pool_push(selector->thumbnail_pool, request, NULL);
 }
 
@@ -357,12 +387,16 @@ static gint compare_paths(gconstpointer first, gconstpointer second)
     return result;
 }
 
-static GPtrArray *find_wallpapers(void)
+static gchar *wallpaper_directory(void)
 {
     const gchar *configured = g_getenv("RICE_WALLPAPER_DIR");
-    gchar *directory = configured != NULL && *configured != '\0'
+    return configured != NULL && *configured != '\0'
         ? g_strdup(configured)
         : path_join_home("Pictures/Wallpapers");
+}
+
+static GPtrArray *find_wallpapers(const gchar *directory)
+{
     GPtrArray *items = g_ptr_array_new_with_free_func(g_free);
     GDir *dir = g_dir_open(directory, 0, NULL);
 
@@ -380,7 +414,6 @@ static GPtrArray *find_wallpapers(void)
     }
 
     g_ptr_array_sort(items, compare_paths);
-    g_free(directory);
     return items;
 }
 
@@ -454,6 +487,98 @@ static void preload_nearby(Selector *selector)
         index %= (gint)selector->items->len;
         request_thumbnail(selector, g_ptr_array_index(selector->items, index));
     }
+}
+
+static gboolean wallpaper_items_equal(GPtrArray *left, GPtrArray *right)
+{
+    if (left->len != right->len) {
+        return FALSE;
+    }
+    for (guint i = 0; i < left->len; i++) {
+        if (g_strcmp0(g_ptr_array_index(left, i),
+                      g_ptr_array_index(right, i)) != 0) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static void reload_wallpapers(Selector *selector,
+                              gboolean invalidate_thumbnails)
+{
+    GPtrArray *items = find_wallpapers(selector->wallpaper_directory);
+    gboolean changed = !wallpaper_items_equal(selector->items, items);
+    if (!changed && !invalidate_thumbnails) {
+        g_ptr_array_unref(items);
+        return;
+    }
+
+    gchar *selected = NULL;
+    guint old_index = selector->index;
+    if (selector->items->len > 0 && old_index < selector->items->len) {
+        selected = g_strdup(g_ptr_array_index(selector->items, old_index));
+    }
+
+    /* Invalidate every in-flight thumbnail when the directory reports a
+     * change. A worker may still finish, but its generation will be rejected
+     * by thumbnail_loaded_on_main. */
+    selector->thumbnail_generation++;
+    g_hash_table_remove_all(selector->pixbufs);
+    g_hash_table_remove_all(selector->loading);
+    g_hash_table_remove_all(selector->failed);
+
+    g_ptr_array_unref(selector->items);
+    selector->items = items;
+
+    selector->index = 0;
+    if (selected != NULL && selector_contains_path(selector, selected)) {
+        for (guint i = 0; i < selector->items->len; i++) {
+            if (g_strcmp0(selected, g_ptr_array_index(selector->items, i)) == 0) {
+                selector->index = i;
+                break;
+            }
+        }
+    } else if (selector->items->len > 0) {
+        selector->index = MIN(old_index, selector->items->len - 1);
+    }
+    g_free(selected);
+
+    gtk_widget_queue_draw(GTK_WIDGET(selector->canvas));
+    preload_nearby(selector);
+}
+
+static gboolean wallpaper_refresh_timeout(gpointer user_data)
+{
+    Selector *selector = user_data;
+    gboolean invalidate = selector->wallpaper_refresh_invalidates_thumbnails;
+    selector->wallpaper_refresh_timer = 0;
+    selector->wallpaper_refresh_invalidates_thumbnails = FALSE;
+    reload_wallpapers(selector, invalidate);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_wallpaper_refresh(Selector *selector,
+                                       gboolean invalidate_thumbnails)
+{
+    selector->wallpaper_refresh_invalidates_thumbnails |= invalidate_thumbnails;
+    if (selector->wallpaper_refresh_timer == 0) {
+        /* File copies commonly emit several events; wait for the burst to
+         * settle before scanning and asking GDK Pixbuf to decode anything. */
+        selector->wallpaper_refresh_timer =
+            g_timeout_add(250, wallpaper_refresh_timeout, selector);
+    }
+}
+
+static void wallpaper_directory_changed(GFileMonitor *monitor, GFile *file,
+                                        GFile *other_file,
+                                        GFileMonitorEvent event_type,
+                                        gpointer user_data)
+{
+    UNUSED(monitor);
+    UNUSED(file);
+    UNUSED(other_file);
+    UNUSED(event_type);
+    schedule_wallpaper_refresh(user_data, TRUE);
 }
 
 static void polygon(cairo_t *cr, gdouble x, gdouble y, gdouble width,
@@ -919,7 +1044,8 @@ static Selector *selector_new(AppState *app)
 {
     Selector *selector = g_new0(Selector, 1);
     selector->app = app;
-    selector->items = find_wallpapers();
+    selector->wallpaper_directory = wallpaper_directory();
+    selector->items = find_wallpapers(selector->wallpaper_directory);
     selector->index = current_wallpaper_index(selector->items);
     selector->pixbufs = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, g_object_unref);
@@ -928,6 +1054,18 @@ static Selector *selector_new(AppState *app)
     selector->colors = palette_from_file();
     selector->thumbnail_pool = g_thread_pool_new(
         thumbnail_worker, NULL, 2, FALSE, NULL);
+
+    GFile *wallpaper_directory_file =
+        g_file_new_for_path(selector->wallpaper_directory);
+    GError *monitor_error = NULL;
+    selector->wallpaper_monitor = g_file_monitor_directory(
+        wallpaper_directory_file, G_FILE_MONITOR_NONE, NULL, &monitor_error);
+    if (selector->wallpaper_monitor != NULL) {
+        g_signal_connect(selector->wallpaper_monitor, "changed",
+                         G_CALLBACK(wallpaper_directory_changed), selector);
+    }
+    g_clear_error(&monitor_error);
+    g_object_unref(wallpaper_directory_file);
 
     selector->window = GTK_APPLICATION_WINDOW(
         gtk_application_window_new(app->application));
@@ -970,10 +1108,15 @@ static void selector_free(Selector *selector)
     if (selector->commit_timer != 0) {
         g_source_remove(selector->commit_timer);
     }
+    if (selector->wallpaper_refresh_timer != 0) {
+        g_source_remove(selector->wallpaper_refresh_timer);
+    }
+    g_clear_object(&selector->wallpaper_monitor);
     if (selector->thumbnail_pool != NULL) {
         g_thread_pool_free(selector->thumbnail_pool, FALSE, TRUE);
     }
     g_clear_pointer(&selector->error, g_free);
+    g_clear_pointer(&selector->wallpaper_directory, g_free);
     g_clear_pointer(&selector->items, g_ptr_array_unref);
     g_clear_pointer(&selector->pixbufs, g_hash_table_unref);
     g_clear_pointer(&selector->loading, g_hash_table_unref);
@@ -996,6 +1139,7 @@ static void activate(GtkApplication *application, gpointer user_data)
         return;
     }
 
+    reload_wallpapers(app->selector, FALSE);
     gtk_window_present(GTK_WINDOW(app->selector->window));
     cycle(app->selector, 1);
 }
