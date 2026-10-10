@@ -5,6 +5,7 @@
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 #include <gtk/gtk.h>
+#include <gtk4-layer-shell.h>
 
 #include <math.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #define APP_ID "io.github.jinho.PaperssWallpaper"
+#define LAYER_NAMESPACE "paperss-wallpaper-selector"
 #define THUMBNAIL_WIDTH 900
 #define THUMBNAIL_HEIGHT 600
 #define THUMBNAIL_RADIUS 2
@@ -1071,8 +1073,26 @@ static Selector *selector_new(AppState *app)
         gtk_application_window_new(app->application));
     gtk_window_set_title(GTK_WINDOW(selector->window), "Paperss Wallpaper Selector");
     gtk_window_set_decorated(GTK_WINDOW(selector->window), FALSE);
-    gtk_window_set_default_size(GTK_WINDOW(selector->window), 1200, 680);
-    gtk_window_fullscreen(GTK_WINDOW(selector->window));
+
+    /* A layer-shell overlay is sized by the compositor to the output before
+     * its first frame. The previous toplevel mapped at a fixed default size
+     * and was then fullscreened, which showed a small window first. No
+     * monitor is set, so the compositor chooses the focused output. */
+    GtkWindow *window = GTK_WINDOW(selector->window);
+    gtk_layer_init_for_window(window);
+    gtk_layer_set_namespace(window, LAYER_NAMESPACE);
+    gtk_layer_set_layer(window, GTK_LAYER_SHELL_LAYER_OVERLAY);
+    gtk_layer_set_keyboard_mode(window, GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE);
+    /* -1 ignores other exclusive zones, so the overlay also covers Waybar's
+     * reserved strip instead of stopping 31px short of the top edge. */
+    gtk_layer_set_exclusive_zone(window, -1);
+    const GtkLayerShellEdge edges[] = {
+        GTK_LAYER_SHELL_EDGE_TOP, GTK_LAYER_SHELL_EDGE_BOTTOM,
+        GTK_LAYER_SHELL_EDGE_LEFT, GTK_LAYER_SHELL_EDGE_RIGHT,
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(edges); i++) {
+        gtk_layer_set_anchor(window, edges[i], TRUE);
+    }
 
     GtkCssProvider *css = gtk_css_provider_new();
     gtk_css_provider_load_from_data(css, "window { background: transparent; }", -1);
@@ -1130,6 +1150,10 @@ static void activate(GtkApplication *application, gpointer user_data)
     AppState *app = user_data;
     UNUSED(application);
     if (app->selector == NULL) {
+        if (!gtk_layer_is_supported()) {
+            g_printerr("wallpaper-selector: compositor does not support wlr-layer-shell\n");
+            return;
+        }
         /* Hold only after this process is the primary application. Remote
          * command-line launchers must be allowed to exit after forwarding. */
         g_application_hold(G_APPLICATION(application));

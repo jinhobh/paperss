@@ -10,8 +10,9 @@ apply. Escape cancels.
 
 ## What it does
 
-- Native GTK 4 fullscreen preview strip written in C, with cached,
-  asynchronous thumbnails.
+- Native GTK 4 layer-shell overlay written in C, with cached,
+  asynchronous thumbnails. It opens on the focused monitor.
+  The layer rule below blurs the background behind it.
 - `swaybg` wallpaper application through Hyprland.
 - Material You palette extraction through Matugen.
 - Per-wallpaper saved color profiles, so returning to an image restores its
@@ -44,11 +45,20 @@ The selector is normally launched by this Hyprland binding:
 bind = $mainMod SHIFT, Tab, exec, wallpaper-selector
 bindr = SUPER, SUPER_L, exec, wallpaper-selector --commit
 bindr = SUPER, SUPER_R, exec, wallpaper-selector --commit
+layerrule {
+    name = paperss-wallpaper-selector
+    match:namespace = ^paperss-wallpaper-selector$
+    blur = true
+    no_anim = true
+}
 ```
 
 The `bindr` lines provide a compositor-level Super-release signal. They are
 important on setups where Wayland does not forward the global modifier release
 to the selector window.
+
+The selector is a layer-shell overlay, so it needs no window placement rules.
+The `layerrule` blurs the background behind it.
 
 Set `RICE_WALLPAPER_DIR` to use a different wallpaper directory. Otherwise the
 selector reads `~/Pictures/Wallpapers`.
@@ -115,6 +125,7 @@ Required runtime pieces:
 - Python 3
 - GTK 4 and GDK Pixbuf development packages (`libgtk-4-dev`,
   `libgdk-pixbuf-2.0-dev`)
+- gtk4-layer-shell development package (`libgtk4-layer-shell-dev`)
 - `pkg-config` and a C compiler
 - Matugen
 - `swaybg`
