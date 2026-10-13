@@ -27,8 +27,8 @@ build_selector() {
         echo "pkg-config is required to build the C wallpaper selector" >&2
         exit 1
     }
-    pkg-config --exists gtk4 gdk-pixbuf-2.0 || {
-        echo "GTK4 development packages are required (gtk4 and gdk-pixbuf-2.0)" >&2
+    pkg-config --exists gtk4 gdk-pixbuf-2.0 gtk4-layer-shell-0 || {
+        echo "GTK4 development packages are required (gtk4, gdk-pixbuf-2.0, and gtk4-layer-shell-0)" >&2
         exit 1
     }
 
@@ -38,7 +38,7 @@ build_selector() {
     echo "building C selector -> $output"
     cc -std=c11 -O2 -Wall -Wextra -Wno-deprecated-declarations \
         "$REPO/src/wallpaper-selector.c" \
-        $(pkg-config --cflags --libs gtk4 gdk-pixbuf-2.0) \
+        $(pkg-config --cflags --libs gtk4 gdk-pixbuf-2.0 gtk4-layer-shell-0) \
         -lm -o "$temporary"
     mv "$temporary" "$output"
 }
@@ -95,7 +95,7 @@ cat <<'NEXT'
 
 Build/runtime dependencies:
   C compiler, pkg-config, GTK 4 development files, GDK Pixbuf development
-  files, Python 3, Matugen, swaybg, Hyprland, Kitty, Waybar, Wofi, and Mako.
+  files, gtk4-layer-shell development files, Python 3, Matugen, swaybg, Hyprland, Kitty, Waybar, Wofi, and Mako.
 
 Optional integrations:
   Firefox/Re:fox and pywalfox, plus Spotify/Spicetify.
@@ -105,6 +105,12 @@ Add this binding to ~/.config/hypr/hyprland.conf if it is not already present:
   bind = $mainMod SHIFT, Tab, exec, wallpaper-selector
   bindr = SUPER, SUPER_L, exec, wallpaper-selector --commit
   bindr = SUPER, SUPER_R, exec, wallpaper-selector --commit
+  layerrule {
+      name = paperss-wallpaper-selector
+      match:namespace = ^paperss-wallpaper-selector$
+      blur = true
+      no_anim = true
+  }
 
 Then reload Hyprland. Super+Shift+Tab opens the selector; release Super or
 press Enter to apply the selected wallpaper and palette.
