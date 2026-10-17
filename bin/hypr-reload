@@ -273,6 +273,10 @@ subtext = {nohash(c['on_surface_variant'])}
         run(["hyprctl", "reload"], env=hypr_env)
     run(["pkill", "-SIGUSR2", "waybar"])
     run(["makoctl", "reload"])
+    # SwayNotificationCenter reads imported GTK colors only when its CSS is
+    # loaded. Rewriting gtk-4.0/rice-colors.css is not enough for the running
+    # control center to notice a wallpaper palette change.
+    run(["swaync-client", "--reload-css"])
 
     # Restarting swaybg is the portable way to show the selected image.
     # Launch through Hyprland so the wallpaper process belongs to the compositor
